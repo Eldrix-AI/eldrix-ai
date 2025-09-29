@@ -411,7 +411,11 @@ app.post("/api/test-call", (req: Request, res: Response): void => {
       const call = await client.calls.create({
         to: phoneNumber,
         from: TWILIO_PHONE_NUMBER,
-        url: `https://f3de0bfe86fd.ngrok-free.app/twilio/test-voice`,
+        url: `${
+          process.env.VERCEL_URL
+            ? `https://${process.env.VERCEL_URL}`
+            : `https://${req.get("host")}`
+        }/twilio/test-voice`,
       });
 
       res.json({
@@ -454,7 +458,11 @@ app.get("/api/test-dial", (req: Request, res: Response) => {
 
   const dial = resp.dial({
     timeout: 30,
-    action: `https://f3de0bfe86fd.ngrok-free.app/twilio/no-answer`,
+    action: `${
+      process.env.VERCEL_URL
+        ? `https://${process.env.VERCEL_URL}`
+        : `https://${req.get("host")}`
+    }/twilio/no-answer`,
     method: "POST",
   });
 
@@ -477,10 +485,11 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
   });
 
   const digits = req.body.Digits;
-  // Force HTTPS for ngrok URLs to ensure proper Twilio webhook handling
-  const host = req.get("host")?.includes("ngrok")
-    ? `https://${req.get("host")}`
-    : `${req.protocol}://${req.get("host")}`;
+  // Force HTTPS for ngrok URLs or Vercel deployments
+  const host =
+    req.get("host")?.includes("ngrok") || process.env.VERCEL_URL
+      ? `https://${req.get("host") || process.env.VERCEL_URL}`
+      : `${req.protocol}://${req.get("host")}`;
   const resp = new VoiceResponse();
 
   // Check if this is a response to the gather with digits
@@ -1106,10 +1115,11 @@ app.post("/twilio/no-answer", (req: Request, res: Response) => {
 app.post("/twilio/free-trial", (req: Request, res: Response) => {
   const digits = req.body.Digits;
   const callerNumber = req.body.From || "";
-  // Force HTTPS for ngrok URLs to ensure proper Twilio webhook handling
-  const host = req.get("host")?.includes("ngrok")
-    ? `https://${req.get("host")}`
-    : `${req.protocol}://${req.get("host")}`;
+  // Force HTTPS for ngrok URLs or Vercel deployments
+  const host =
+    req.get("host")?.includes("ngrok") || process.env.VERCEL_URL
+      ? `https://${req.get("host") || process.env.VERCEL_URL}`
+      : `${req.protocol}://${req.get("host")}`;
 
   console.log("🎁 FREE TRIAL RESPONSE", {
     callSid: req.body.CallSid,
@@ -1515,7 +1525,9 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
 
           // Common part of the message including chat link
           const chatLink = helpSessionId
-            ? `http://localhost:3001/chat?id=${helpSessionId}`
+            ? `${
+                process.env.FRONTEND_URL || "http://localhost:3001"
+              }/chat?id=${helpSessionId}`
             : "";
 
           await client.messages.create({
@@ -2145,6 +2157,12 @@ app.post("/twilio/sms/respond", (req: Request, res: Response) => {
   })();
 });
 
-app.listen(Number(PORT), () => {
-  console.log(`🚀 Listening on http://localhost:${PORT}`);
-});
+// Start the server if not being imported by the API endpoint
+if (process.env.VERCEL_ENV !== "production") {
+  app.listen(Number(PORT), () => {
+    console.log(`🚀 Listening on http://localhost:${PORT}`);
+  });
+}
+
+// Export the app for Vercel deployment
+export { app };

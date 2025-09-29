@@ -37,6 +37,9 @@ const {
   AWS_SECRET_ACCESS_KEY,
   AWS_REGION = "us-east-2",
   AWS_BUCKET_NAME = "deepskygallery",
+
+  // Stripe configuration
+  STRIPE_SECRET_KEY,
 } = process.env;
 
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
@@ -111,7 +114,7 @@ interface User {
   [key: string]: any; // For other fields we may not use directly
 }
 
-// Function to find user by phone number
+// Function to find user by phone number with Stripe subscription data
 async function findUserByPhone(phone: string): Promise<User | null> {
   const cleanedPhone = cleanPhoneNumber(phone);
   console.log(`🔍 Looking up user with phone: ${cleanedPhone}`);
@@ -135,6 +138,12 @@ async function findUserByPhone(phone: string): Promise<User | null> {
     if (Array.isArray(rows) && rows.length > 0) {
       const user = rows[0] as User;
       console.log(`✅ User found: ${user.name}`);
+
+      // Log Stripe subscription info for debugging
+      console.log(
+        `💳 Stripe info - Customer ID: ${user.stripeCustomerId}, Subscription ID: ${user.stripeSubscriptionId}, Usage ID: ${user.stripeUsageId}`
+      );
+
       return user;
     } else {
       console.log("❌ No user found with that phone number");
@@ -232,6 +241,106 @@ async function recordFreeTrial(phone: string): Promise<boolean> {
   }
 }
 
+// Function to report usage to Stripe for pay-as-you-go users
+async function reportStripeUsage(
+  userId: string,
+  sessionId: string
+): Promise<boolean> {
+  console.log(
+    `💳 Reporting Stripe usage for user ${userId}, session ${sessionId}`
+  );
+
+  try {
+    // Get user's Stripe data
+    const [userRows]: [any[], any] = await dbPool.execute(
+      "SELECT stripeCustomerId, stripeUsageId, stripeSubscriptionId FROM User WHERE id = ?",
+      [userId]
+    );
+
+    if (!Array.isArray(userRows) || userRows.length === 0) {
+      console.log(`❌ No user found with ID ${userId}`);
+      return false;
+    }
+
+    const userData = userRows[0];
+
+    // Check if user is on pay-as-you-go plan (has usage ID but no subscription ID)
+    if (!userData.stripeUsageId || userData.stripeSubscriptionId) {
+      console.log(
+        `ℹ️ User ${userId} is not on pay-as-you-go plan - skipping usage reporting`
+      );
+      return true; // Not an error, just not applicable
+    }
+
+    if (!userData.stripeCustomerId) {
+      console.error(`❌ User ${userId} has usage ID but no customer ID`);
+      return false;
+    }
+
+    console.log(
+      `💳 Processing usage-based billing for pay-as-you-go user ${userId}`
+    );
+
+    // Report usage to Stripe using the meter events API
+    const response = await fetch(
+      `https://api.stripe.com/v1/billing/meter_events`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          event_name: "api_requests", // The meter name configured in Stripe
+          "payload[value]": "1", // The value to increment by
+          "payload[stripe_customer_id]": userData.stripeCustomerId, // Customer ID is required
+        }).toString(),
+      }
+    );
+
+    const result = await response.json();
+
+    if (response.ok) {
+      console.log(
+        `✅ Successfully reported usage to Stripe for user ${userId}:`,
+        result
+      );
+
+      // Store usage record in StripeUsage table
+      try {
+        const usageId = uuidv4();
+        await dbPool.execute(
+          "INSERT INTO StripeUsage (id, userId, stripeUsageId, stripeCustomerId, sessionId, usageType, quantity, unitPrice, totalAmount, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          [
+            usageId,
+            userId,
+            userData.stripeUsageId,
+            userData.stripeCustomerId,
+            sessionId,
+            "help_session",
+            1, // quantity
+            0.0, // unitPrice - will be set by Stripe
+            0.0, // totalAmount - will be set by Stripe
+            "pending",
+          ]
+        );
+        console.log(`✅ Stored usage record in database: ${usageId}`);
+      } catch (dbError) {
+        console.error("Error storing usage record in database:", dbError);
+        // Don't fail the whole operation if we can't store the record
+      }
+
+      return true;
+    } else {
+      console.error(`❌ Failed to report usage to Stripe:`, result);
+      return false;
+    }
+  } catch (error) {
+    console.error("Error reporting usage to Stripe:", error);
+    return false;
+  }
+}
+
 // Function to create a help session record when a user connects to representative
 async function createHelpSession(
   userId: string,
@@ -255,7 +364,44 @@ async function createHelpSession(
     // Set lastMessage if provided
     const lastMessageValue = initialMessage ? initialMessage : null;
 
-    // Insert a new help session record with priority set to medium
+    // Get user data to check subscription status for priority setting
+    let priority = "medium"; // Default priority
+    try {
+      const [userRows]: [any[], any] = await dbPool.execute(
+        "SELECT stripeSubscriptionId, stripeUsageId, stripeCustomerId FROM User WHERE id = ?",
+        [userId]
+      );
+
+      if (Array.isArray(userRows) && userRows.length > 0) {
+        const userData = userRows[0];
+
+        // Set priority based on subscription status
+        // If user has a subscription, they get high priority
+        if (userData.stripeSubscriptionId) {
+          priority = "high";
+          console.log(
+            `💳 User ${userId} has active subscription - setting priority to HIGH`
+          );
+        } else if (userData.stripeUsageId) {
+          // Pay-as-you-go users get medium priority (default)
+          priority = "medium";
+          console.log(
+            `💳 User ${userId} is on pay-as-you-go plan - setting priority to MEDIUM`
+          );
+        } else {
+          // Free users get low priority
+          priority = "low";
+          console.log(
+            `💳 User ${userId} is a free user - setting priority to LOW`
+          );
+        }
+      }
+    } catch (userError) {
+      console.error("Error fetching user subscription data:", userError);
+      // Keep default medium priority if we can't fetch user data
+    }
+
+    // Insert a new help session record with priority based on subscription status
     await dbPool.execute(
       "INSERT INTO HelpSession (id, userId, type, title, status, priority, createdAt, updatedAt, lastMessage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       [
@@ -264,7 +410,7 @@ async function createHelpSession(
         callType,
         title,
         "ongoing",
-        "medium", // Always set priority to medium
+        priority, // Set priority based on subscription status
         now,
         now,
         lastMessageValue,
@@ -272,8 +418,16 @@ async function createHelpSession(
     );
 
     console.log(
-      `✅ Successfully created help session ${sessionId} for user ${userId}`
+      `✅ Successfully created help session ${sessionId} for user ${userId} with priority: ${priority}`
     );
+
+    // Report usage to Stripe for pay-as-you-go users (only for new sessions)
+    try {
+      await reportStripeUsage(userId, sessionId);
+    } catch (usageError) {
+      console.error("Error reporting usage to Stripe:", usageError);
+      // Don't fail the session creation if usage reporting fails
+    }
 
     // Return the session ID so we can add messages to it
     return sessionId;
@@ -739,9 +893,53 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
             whisperType = "customer";
             whisperName = user.name;
 
-            // If this isn't an existing active session, create a new one for phone support
+            // If this isn't an existing active session, check for pay-as-you-go restrictions before creating new one
             if (!isActiveSession) {
               try {
+                // Check if user is on pay-as-you-go plan to prevent multiple sessions
+                const [userRows]: [any[], any] = await dbPool.execute(
+                  "SELECT stripeUsageId, stripeSubscriptionId FROM User WHERE id = ?",
+                  [user.id]
+                );
+
+                const userData = userRows[0];
+                const isPayAsYouGo =
+                  userData &&
+                  userData.stripeUsageId &&
+                  !userData.stripeSubscriptionId;
+
+                if (isPayAsYouGo) {
+                  // For pay-as-you-go users, check if they have any recent sessions (within last 24 hours)
+                  const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+                  const [recentSessions]: [any[], any] = await dbPool.execute(
+                    "SELECT * FROM HelpSession WHERE userId = ? AND createdAt > ? ORDER BY createdAt DESC LIMIT 1",
+                    [user.id, oneDayAgo]
+                  );
+
+                  if (recentSessions.length > 0) {
+                    console.log(
+                      `⚠️ Pay-as-you-go user ${user.name} has a recent session - preventing new phone session creation`
+                    );
+
+                    // Send SMS notification to user explaining they need to wait
+                    await client.messages.create({
+                      body: `Hello ${user.name}! You already have a recent help session. Please wait 24 hours before starting a new session, or complete your current session first.`,
+                      from: TWILIO_PHONE_NUMBER,
+                      to: callerNumber,
+                    });
+
+                    // Notify admin
+                    await sendSmsNotification(
+                      "denied due to recent session (pay-as-you-go)",
+                      callerNumber,
+                      `${user.name} tried to call but has a recent session within 24 hours`
+                    );
+
+                    // Return early - don't forward this call
+                    return;
+                  }
+                }
+
                 const helpSessionId = await createHelpSession(user.id, "phone");
                 console.log(
                   `📝 Created new help session ${helpSessionId} for phone support with ${user.name}`
@@ -1468,6 +1666,52 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
                 `✅ Found existing session ${helpSessionId} for user ${user.name} - continuing conversation via SMS`
               );
             } else {
+              // Check if user is on pay-as-you-go plan to prevent multiple sessions
+              const [userRows]: [any[], any] = await dbPool.execute(
+                "SELECT stripeUsageId, stripeSubscriptionId FROM User WHERE id = ?",
+                [user.id]
+              );
+
+              const userData = userRows[0];
+              const isPayAsYouGo =
+                userData &&
+                userData.stripeUsageId &&
+                !userData.stripeSubscriptionId;
+
+              if (isPayAsYouGo) {
+                // For pay-as-you-go users, check if they have any recent sessions (within last 24 hours)
+                const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+                const [recentSessions]: [any[], any] = await dbPool.execute(
+                  "SELECT * FROM HelpSession WHERE userId = ? AND createdAt > ? ORDER BY createdAt DESC LIMIT 1",
+                  [user.id, oneDayAgo]
+                );
+
+                if (recentSessions.length > 0) {
+                  console.log(
+                    `⚠️ Pay-as-you-go user ${user.name} has a recent session - preventing new session creation`
+                  );
+
+                  // Send message to user explaining they need to wait
+                  await client.messages.create({
+                    body: `Hello ${user.name}! You already have a recent help session. Please wait 24 hours before starting a new session, or complete your current session first.`,
+                    from: TWILIO_PHONE_NUMBER,
+                    to: senderNumber,
+                  });
+
+                  // Notify admin
+                  await client.messages.create({
+                    body: `ELDRIX SMS ALERT: Pay-as-you-go user ${user.name} (${senderNumber}) tried to start a new session but has a recent one. Message not forwarded.`,
+                    from: TWILIO_PHONE_NUMBER,
+                    to: ADMIN_PHONE,
+                  });
+
+                  // Send TwiML response and return early
+                  const twiml = new MessagingResponse();
+                  res.type("text/xml").send(twiml.toString());
+                  return;
+                }
+              }
+
               // No existing active session found - create a new one
               console.log(
                 `📝 No active session found - creating new SMS session for user ${user.name}`

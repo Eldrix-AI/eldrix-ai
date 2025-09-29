@@ -770,13 +770,21 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
           const whisperUrl = `${host}/twilio/whisper?${whisperParams}`;
           console.log(`💬 WHISPER URL: ${whisperUrl}`);
 
+          // Pass caller info to no-answer handler
+          const callerInfo = JSON.stringify({
+            type: whisperType,
+            name: whisperName,
+          });
+
           // Build the response with whisper and recording enabled
           // Note: For machine detection, we'll need to use call creation API instead,
           // as TwiML doesn't support all machine detection features
           const dial = resp.dial({
             timeout: 20, // Shorter timeout to avoid long waits
             callerId: TWILIO_PHONE_NUMBER,
-            action: `${host}/twilio/no-answer`,
+            action: `${host}/twilio/no-answer?callerInfo=${encodeURIComponent(
+              callerInfo
+            )}`,
             method: "POST",
             record: "record-from-answer", // Start recording when the call is answered
             recordingStatusCallback: `${host}/twilio/recording-status?originalCaller=${encodeURIComponent(
@@ -928,6 +936,29 @@ app.post("/twilio/no-answer", (req: Request, res: Response) => {
 
   console.log(`📞 MACHINE DETECTION: ${machineDetection || "not detected"}`);
 
+  // Get caller info from original call
+  const originalCallerNumber = req.body.From || "";
+  const callerParams = req.query.callerInfo
+    ? JSON.parse(decodeURIComponent(req.query.callerInfo as string))
+    : {};
+  const callerType = callerParams.type || "unknown";
+  const callerName = callerParams.name || "";
+  const isRegistered = callerType === "customer";
+  const isFreeTrial = callerType === "freetrial";
+  const isReturning = callerType === "returning";
+
+  // Prepare caller description for admin notification
+  let callerDescription = "";
+  if (isRegistered) {
+    callerDescription = `registered customer ${callerName}`;
+  } else if (isFreeTrial) {
+    callerDescription = "free trial customer";
+  } else if (isReturning) {
+    callerDescription = "returning customer who already used their free trial";
+  } else {
+    callerDescription = "unknown caller type";
+  }
+
   // Check for answering machine/voicemail
   if (machineDetection === "machine") {
     // Handle voicemail scenario
@@ -941,6 +972,52 @@ app.post("/twilio/no-answer", (req: Request, res: Response) => {
       "<speak>Hello, this is Eldrix calling. We received your call but couldn't reach you. Please call us back during business hours or send us a text message for faster support. Thank you!</speak>"
     );
     resp.hangup();
+
+    // Send follow-up SMS after voicemail
+    if (originalCallerNumber && TWILIO_PHONE_NUMBER) {
+      try {
+        client.messages
+          .create({
+            body: "We just tried to reach you but got your voicemail. For faster support, reply to this message and we'll assist you right away.",
+            from: TWILIO_PHONE_NUMBER,
+            to: originalCallerNumber,
+          })
+          .then((message) => {
+            console.log(
+              `✅ Follow-up SMS sent after voicemail: ${message.sid}`
+            );
+          })
+          .catch((err) => {
+            console.error("Error sending follow-up SMS after voicemail:", err);
+          });
+      } catch (error) {
+        console.error("Error initiating follow-up SMS after voicemail:", error);
+      }
+    }
+
+    // Notify admin about voicemail
+    try {
+      client.messages
+        .create({
+          body: `📞 MISSED CALL ALERT: ${originalCallerNumber} (${callerDescription}) called but went to voicemail. A follow-up SMS has been sent to them.`,
+          from: TWILIO_PHONE_NUMBER,
+          to: ADMIN_PHONE,
+        })
+        .then((message) => {
+          console.log(`✅ Admin notified about voicemail: ${message.sid}`);
+        })
+        .catch((err) => {
+          console.error(
+            "Error sending admin notification about voicemail:",
+            err
+          );
+        });
+    } catch (error) {
+      console.error(
+        "Error initiating admin notification about voicemail:",
+        error
+      );
+    }
   }
   // Check if the call was actually answered and completed (normal hang up)
   else if (dialStatus === "completed" && dialDuration > 0) {
@@ -967,6 +1044,58 @@ app.post("/twilio/no-answer", (req: Request, res: Response) => {
       },
       "<speak>Sorry, we couldn't reach our representative at this time. <break time='300ms'/> We'll call you back as soon as possible. <break time='200ms'/> For faster responses, please try texting us instead. <break time='200ms'/> Thank you for contacting Eldrix!</speak>"
     );
+
+    // Send follow-up SMS after failed call
+    if (originalCallerNumber && TWILIO_PHONE_NUMBER) {
+      try {
+        client.messages
+          .create({
+            body: "Sorry we missed your call! For immediate support, reply to this message and our team will assist you right away.",
+            from: TWILIO_PHONE_NUMBER,
+            to: originalCallerNumber,
+          })
+          .then((message) => {
+            console.log(
+              `✅ Follow-up SMS sent after missed call: ${message.sid}`
+            );
+          })
+          .catch((err) => {
+            console.error(
+              "Error sending follow-up SMS after missed call:",
+              err
+            );
+          });
+      } catch (error) {
+        console.error(
+          "Error initiating follow-up SMS after missed call:",
+          error
+        );
+      }
+    }
+
+    // Notify admin about missed call
+    try {
+      client.messages
+        .create({
+          body: `📞 MISSED CALL ALERT: ${originalCallerNumber} (${callerDescription}) called but the call was not answered (${dialStatus}). A follow-up SMS has been sent to them.`,
+          from: TWILIO_PHONE_NUMBER,
+          to: ADMIN_PHONE,
+        })
+        .then((message) => {
+          console.log(`✅ Admin notified about missed call: ${message.sid}`);
+        })
+        .catch((err) => {
+          console.error(
+            "Error sending admin notification about missed call:",
+            err
+          );
+        });
+    } catch (error) {
+      console.error(
+        "Error initiating admin notification about missed call:",
+        error
+      );
+    }
   }
 
   resp.hangup();

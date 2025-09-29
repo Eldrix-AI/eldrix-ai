@@ -264,10 +264,11 @@ async function reportStripeUsage(
 
     const userData = userRows[0];
 
-    // Check if user is on pay-as-you-go plan (has usage ID but no subscription ID)
-    if (!userData.stripeUsageId || userData.stripeSubscriptionId) {
+    // Check if user is on pay-as-you-go plan (has usage ID)
+    // If user has a usage ID, they should be charged regardless of subscription status
+    if (!userData.stripeUsageId) {
       console.log(
-        `ℹ️ User ${userId} is not on pay-as-you-go plan - skipping usage reporting`
+        `ℹ️ User ${userId} has no usage ID - skipping usage reporting`
       );
       return true; // Not an error, just not applicable
     }
@@ -383,7 +384,7 @@ async function createHelpSession(
             `💳 User ${userId} has active subscription - setting priority to HIGH`
           );
         } else if (userData.stripeUsageId) {
-          // Pay-as-you-go users get medium priority (default)
+          // Pay-as-you-go users (no subscription) get medium priority
           priority = "medium";
           console.log(
             `💳 User ${userId} is on pay-as-you-go plan - setting priority to MEDIUM`

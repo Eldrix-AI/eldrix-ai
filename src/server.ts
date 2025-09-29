@@ -13,8 +13,6 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
-export const dynamic = "force-dynamic";
-
 dotenv.config();
 const {
   PORT = "3000",
@@ -2157,12 +2155,7 @@ app.post("/twilio/sms/respond", (req: Request, res: Response) => {
   })();
 });
 
-// Start the server if not being imported by the API endpoint
-if (process.env.VERCEL_ENV !== "production") {
-  app.listen(Number(PORT), () => {
-    console.log(`🚀 Listening on http://localhost:${PORT}`);
-  });
-}
-
-// Export the app for Vercel deployment
-export { app };
+// Start the server
+app.listen(Number(PORT), () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});

@@ -139,16 +139,17 @@ async function countUserSessions(userId: string) {
       `⚠️ DEBUG - Counting sessions for user ${userId} between ${firstDayFormatted} and ${nextMonthFormatted}`
     );
 
-    // Query that only counts sessions from the current month
+    // Query that only counts COMPLETED sessions from the current month
+    // Exclude active sessions (completed = 0) since they don't count against the limit
     const [rows] = await dbPool.execute(
-      "SELECT COUNT(*) as count FROM HelpSession WHERE userId = ? AND createdAt >= ? AND createdAt < ?",
+      "SELECT COUNT(*) as count FROM HelpSession WHERE userId = ? AND createdAt >= ? AND createdAt < ? AND completed = 1",
       [userId, firstDayFormatted, nextMonthFormatted]
     );
 
     if (Array.isArray(rows) && rows.length > 0) {
       const count = (rows[0] as any).count;
       console.log(
-        `📊 User has ${count} help sessions this month (${now.toLocaleString(
+        `📊 User has ${count} completed help sessions this month (${now.toLocaleString(
           "default",
           { month: "long" }
         )})`
@@ -560,20 +561,63 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
                 `✅ CONNECTING REGISTERED USER: ${user.name} (${sessionCount}/3 sessions used)`
               );
 
-              // Create a help session record
+              // Check for existing active session before creating a new one
+              let helpSessionId: string | null = null;
               try {
-                const helpSessionId = await createHelpSession(user.id, "phone");
-                if (helpSessionId) {
+                // Check for an existing active (uncompleted) session of ANY type for this user
+                const [existingSessions]: [any[], any] = await dbPool.execute(
+                  "SELECT * FROM HelpSession WHERE userId = ? AND completed = 0 ORDER BY createdAt DESC LIMIT 1",
+                  [user.id]
+                );
+
+                // Filter for sessions with active statuses
+                const incompleteSessions = existingSessions.filter(
+                  (session) =>
+                    session.status === "pending" ||
+                    session.status === "active" ||
+                    session.status === "ongoing" ||
+                    session.status === "open"
+                );
+
+                if (incompleteSessions.length > 0) {
+                  // Found an existing active session - use it and update type if needed
+                  const existingSession = incompleteSessions[0];
+                  helpSessionId = existingSession.id;
+
+                  // Check if we need to update the session type
+                  if (existingSession.type !== "phone") {
+                    console.log(
+                      `🔄 Switching session ${helpSessionId} from ${existingSession.type} to phone for user ${user.name}`
+                    );
+
+                    // Update the session type to phone
+                    await dbPool.execute(
+                      "UPDATE HelpSession SET type = 'phone', updatedAt = ? WHERE id = ?",
+                      [new Date(), helpSessionId]
+                    );
+                  }
+
                   console.log(
-                    `✅ Created help session ${helpSessionId} for user ${user.name}`
+                    `✅ Found existing session ${helpSessionId} for user ${user.name} - continuing conversation via phone`
                   );
                 } else {
-                  console.error(
-                    `⚠️ Failed to create help session for user ${user.name}`
+                  // No existing active session found - create a new one
+                  console.log(
+                    `📝 No active session found - creating new phone session for user ${user.name}`
                   );
+                  helpSessionId = await createHelpSession(user.id, "phone");
+                  if (helpSessionId) {
+                    console.log(
+                      `✅ Created new help session ${helpSessionId} for user ${user.name}`
+                    );
+                  } else {
+                    console.error(
+                      `⚠️ Failed to create help session for user ${user.name}`
+                    );
+                  }
                 }
               } catch (sessionError) {
-                console.error("Error creating help session:", sessionError);
+                console.error("Error managing help session:", sessionError);
               }
 
               // Use just the phone number for callerId (most compatible with carriers)
@@ -994,15 +1038,41 @@ app.post("/twilio/whisper", (req: Request, res: Response) => {
 
 // 6) SMS handling endpoint for incoming text messages
 app.post("/twilio/sms", (req: Request, res: Response) => {
+  // Check for media attachments
+  const mediaCount = parseInt(req.body.NumMedia || "0");
+  const mediaUrls: string[] = [];
+
+  if (mediaCount > 0) {
+    for (let i = 0; i < mediaCount; i++) {
+      const mediaUrl = req.body[`MediaUrl${i}`];
+      if (mediaUrl) {
+        mediaUrls.push(mediaUrl);
+      }
+    }
+  }
+
   console.log("📱 INCOMING SMS", {
     from: req.body.From,
     to: req.body.To,
     body: req.body.Body,
+    mediaCount: mediaCount,
+    mediaUrls: mediaUrls,
     timestamp: new Date().toISOString(),
   });
 
   const senderNumber = req.body.From || "";
   const messageBody = req.body.Body || "";
+
+  // Create a combined message content that includes both text and media info
+  let combinedMessage = messageBody;
+  if (mediaUrls.length > 0) {
+    const mediaInfo = mediaUrls
+      .map((url, index) => `[Image ${index + 1}: ${url}]`)
+      .join(" ");
+    combinedMessage = messageBody
+      ? `${messageBody}\n\n${mediaInfo}`
+      : mediaInfo;
+  }
 
   // Make the response async to handle database operations
   (async () => {
@@ -1032,7 +1102,7 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
 
           // Notify admin but don't forward the message
           await client.messages.create({
-            body: `ELDRIX SMS ALERT: Message received from ${senderNumber} (${user.name}), but not forwarded because they've used all their monthly sessions.\n\nTheir message: "${messageBody}"`,
+            body: `ELDRIX SMS ALERT: Message received from ${senderNumber} (${user.name}), but not forwarded because they've used all their monthly sessions.\n\nTheir message: "${combinedMessage}"`,
             from: TWILIO_PHONE_NUMBER,
             to: ADMIN_PHONE,
           });
@@ -1047,37 +1117,56 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
           let helpSessionId: string | null = null;
 
           try {
-            // Check for an existing active (uncompleted) SMS session for this user
+            // Check for an existing active (uncompleted) session of ANY type for this user
             const [existingSessions]: [any[], any] = await dbPool.execute(
-              "SELECT * FROM HelpSession WHERE userId = ? AND type = 'sms' AND completed = 0 ORDER BY createdAt DESC LIMIT 1",
+              "SELECT * FROM HelpSession WHERE userId = ? AND completed = 0 ORDER BY createdAt DESC LIMIT 1",
               [user.id]
             );
 
-            // Update our isNewSession flag based on query results
-            isNewSession =
-              !Array.isArray(existingSessions) || existingSessions.length === 0;
+            // Filter for sessions with active statuses
+            const incompleteSessions = existingSessions.filter(
+              (session) =>
+                session.status === "pending" ||
+                session.status === "active" ||
+                session.status === "ongoing" ||
+                session.status === "open"
+            );
+
+            // Update our isNewSession flag based on filtered results
+            isNewSession = incompleteSessions.length === 0;
 
             // helpSessionId is already declared in the outer scope
 
-            if (
-              Array.isArray(existingSessions) &&
-              existingSessions.length > 0
-            ) {
-              // Found an existing active SMS session - use it instead of creating a new one
-              const existingSession = existingSessions[0];
+            if (incompleteSessions.length > 0) {
+              // Found an existing active session - use it and update type if needed
+              const existingSession = incompleteSessions[0];
               helpSessionId = existingSession.id;
+
+              // Check if we need to update the session type
+              if (existingSession.type !== "sms") {
+                console.log(
+                  `🔄 Switching session ${helpSessionId} from ${existingSession.type} to SMS for user ${user.name}`
+                );
+
+                // Update the session type to SMS
+                await dbPool.execute(
+                  "UPDATE HelpSession SET type = 'sms', updatedAt = ? WHERE id = ?",
+                  [new Date(), helpSessionId]
+                );
+              }
+
               console.log(
-                `✅ Found existing SMS session ${helpSessionId} for user ${user.name} - continuing conversation`
+                `✅ Found existing session ${helpSessionId} for user ${user.name} - continuing conversation via SMS`
               );
             } else {
-              // No existing active SMS session found - create a new one
+              // No existing active session found - create a new one
               console.log(
-                `📝 No active SMS session found - creating new session for user ${user.name}`
+                `📝 No active session found - creating new SMS session for user ${user.name}`
               );
               helpSessionId = await createHelpSession(
                 user.id,
                 "sms",
-                messageBody
+                combinedMessage
               );
               if (helpSessionId) {
                 console.log(
@@ -1095,7 +1184,7 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
               // Store the message in the database
               const messageResult = await createMessage(
                 helpSessionId,
-                messageBody,
+                combinedMessage,
                 false
               );
               if (messageResult) {
@@ -1129,7 +1218,7 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
             : "";
 
           await client.messages.create({
-            body: `${adminMessagePrefix}To reply directly to this user, respond with your message OR start with their number: ${senderNumber} Your message here\n\nClick here to respond in web interface: ${chatLink}\n\n${messageBody}`,
+            body: `${adminMessagePrefix}To reply directly to this user, respond with your message OR start with their number: ${senderNumber} Your message here\n\nClick here to respond in web interface: ${chatLink}\n\n${combinedMessage}`,
             from: TWILIO_PHONE_NUMBER,
             to: ADMIN_PHONE,
           });
@@ -1175,7 +1264,7 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
 
           // Notify admin but don't forward
           await client.messages.create({
-            body: `ELDRIX SMS ALERT: Message received from ${senderNumber}, but not forwarded because they've already used their free trial.\n\nTheir message: "${messageBody}"`,
+            body: `ELDRIX SMS ALERT: Message received from ${senderNumber}, but not forwarded because they've already used their free trial.\n\nTheir message: "${combinedMessage}"`,
             from: TWILIO_PHONE_NUMBER,
             to: ADMIN_PHONE,
           });
@@ -1191,7 +1280,7 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
 
           // Forward the message to admin/representative with free trial info
           await client.messages.create({
-            body: `FREE TRIAL SMS from: ${senderNumber}\n\nTo reply directly to this user, respond with your message OR start with their number: ${senderNumber} Your message here\n\nClick here to respond in web interface: http://localhost:3001/chat?id=${freeTrialSessionId}\n\n${messageBody}`,
+            body: `FREE TRIAL SMS from: ${senderNumber}\n\nTo reply directly to this user, respond with your message OR start with their number: ${senderNumber} Your message here\n\nClick here to respond in web interface: http://localhost:3001/chat?id=${freeTrialSessionId}\n\n${combinedMessage}`,
             from: TWILIO_PHONE_NUMBER,
             to: ADMIN_PHONE,
           });
@@ -1269,16 +1358,39 @@ app.post("/twilio/sms-reply", (req: Request, res: Response) => {
       if (user) {
         // Look for an active help session for this user
         try {
-          // Find the most recent active SMS help session for this user
+          // Find the most recent active help session for this user (any type)
           const [sessions]: [any[], any] = await dbPool.execute(
-            "SELECT * FROM HelpSession WHERE userId = ? AND type = 'sms' AND status != 'completed' ORDER BY createdAt DESC LIMIT 1",
+            "SELECT * FROM HelpSession WHERE userId = ? AND completed = 0 ORDER BY createdAt DESC LIMIT 1",
             [user.id]
           );
 
-          if (Array.isArray(sessions) && sessions.length > 0) {
-            const session = sessions[0];
+          // Filter for sessions with active statuses
+          const incompleteSessions = sessions.filter(
+            (session) =>
+              session.status === "pending" ||
+              session.status === "active" ||
+              session.status === "ongoing" ||
+              session.status === "open"
+          );
+
+          if (incompleteSessions.length > 0) {
+            const session = incompleteSessions[0];
+
+            // Check if we need to update the session type to SMS (since admin is replying via SMS)
+            if (session.type !== "sms") {
+              console.log(
+                `🔄 Switching session ${session.id} from ${session.type} to SMS for admin reply to user ${user.name}`
+              );
+
+              // Update the session type to SMS
+              await dbPool.execute(
+                "UPDATE HelpSession SET type = 'sms', updatedAt = ? WHERE id = ?",
+                [new Date(), session.id]
+              );
+            }
+
             console.log(
-              `✅ Found active SMS help session ${session.id} for user ${user.name}`
+              `✅ Found active help session ${session.id} for user ${user.name} - admin replying via SMS`
             );
 
             // Store the admin's message in the database
@@ -1298,7 +1410,7 @@ app.post("/twilio/sms-reply", (req: Request, res: Response) => {
             }
           } else {
             console.log(
-              `⚠️ No active SMS help session found for user ${user.name}. Creating a new one.`
+              `⚠️ No active help session found for user ${user.name}. Creating a new SMS session.`
             );
 
             // Create a new help session with the admin's message
@@ -1366,13 +1478,14 @@ app.post("/twilio/sms/respond", (req: Request, res: Response) => {
     sessionId: req.body.sessionId,
     userId: req.body.userId,
     messageLength: req.body.message?.length || 0,
+    imageUrl: req.body.imageUrl || null,
     timestamp: new Date().toISOString(),
   });
 
   (async () => {
     try {
       // Validate required parameters
-      const { sessionId, message, userId } = req.body;
+      const { sessionId, message, userId, imageUrl } = req.body;
 
       if (!sessionId || !message || !userId) {
         console.error("⚠️ Missing required parameters for SMS respond API");
@@ -1439,14 +1552,24 @@ app.post("/twilio/sms/respond", (req: Request, res: Response) => {
         : `+${phoneNumber}`;
 
       // Send the SMS through Twilio (no chat link for users)
-      const smsResult = await client.messages.create({
+      const messageOptions: any = {
         body: message,
         from: TWILIO_PHONE_NUMBER,
         to: formattedPhone,
-      });
+      };
+
+      // Add image URL if provided
+      if (imageUrl) {
+        messageOptions.mediaUrl = [imageUrl];
+        console.log(`📷 Including image in SMS: ${imageUrl}`);
+      }
+
+      const smsResult = await client.messages.create(messageOptions);
 
       console.log(
-        `✅ Successfully sent SMS to ${formattedPhone}, SID: ${smsResult.sid}`
+        `✅ Successfully sent SMS to ${formattedPhone}, SID: ${smsResult.sid}${
+          imageUrl ? " with image" : ""
+        }`
       );
 
       // Skip storing message in database - this will be handled by the external system
@@ -1456,6 +1579,7 @@ app.post("/twilio/sms/respond", (req: Request, res: Response) => {
         success: true,
         messageId: smsResult.sid,
         to: formattedPhone,
+        imageIncluded: !!imageUrl,
       });
     } catch (error) {
       console.error("Error processing SMS respond request:", error);

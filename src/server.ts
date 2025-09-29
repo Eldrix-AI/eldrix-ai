@@ -4,6 +4,16 @@ import dotenv from "dotenv";
 import Twilio from "twilio";
 import mysql from "mysql2/promise";
 import { v4 as uuidv4 } from "uuid";
+import axios from "axios";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { createWriteStream } from "fs";
+import { promisify } from "util";
+import { pipeline } from "stream";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
+
+export const dynamic = "force-dynamic";
 
 dotenv.config();
 const {
@@ -23,6 +33,12 @@ const {
   DB_NAME,
   DB_PORT,
   DATABASE_URL,
+
+  // AWS configuration for S3 storage
+  AWS_ACCESS_KEY_ID,
+  AWS_SECRET_ACCESS_KEY,
+  AWS_REGION = "us-east-2",
+  AWS_BUCKET_NAME = "deepskygallery",
 } = process.env;
 
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
@@ -41,6 +57,15 @@ if (!DB_HOST || !DB_USER || !DB_PASSWORD || !DB_NAME) {
 const client = Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const { VoiceResponse, MessagingResponse } = Twilio.twiml;
 const app = express();
+
+// Configure the AWS S3 client
+const s3Client = new S3Client({
+  region: AWS_REGION,
+  credentials: {
+    accessKeyId: AWS_ACCESS_KEY_ID!,
+    secretAccessKey: AWS_SECRET_ACCESS_KEY!,
+  },
+});
 
 // Create database connection pool using DATABASE_URL or individual parameters
 let dbPool: mysql.Pool;
@@ -358,6 +383,88 @@ app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", time: Date.now() });
 });
 
+// Debug endpoint to check phone number configuration
+app.get("/api/debug/phone", (_req, res) => {
+  res.json({
+    forwardNumber: FORWARD_NUMBER,
+    adminPhone: ADMIN_PHONE,
+    twilioPhoneNumber: TWILIO_PHONE_NUMBER,
+    forwardNumberLength: FORWARD_NUMBER.length,
+    expectedLength: 12, // +1 + 10 digits
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Test endpoint to make a direct call (for debugging)
+app.post("/api/test-call", (req: Request, res: Response): void => {
+  const { phoneNumber } = req.body;
+
+  if (!phoneNumber) {
+    res.status(400).json({ error: "phoneNumber is required" });
+    return;
+  }
+
+  (async () => {
+    try {
+      console.log(`🧪 TEST CALL: Attempting to call ${phoneNumber}`);
+
+      const call = await client.calls.create({
+        to: phoneNumber,
+        from: TWILIO_PHONE_NUMBER,
+        url: `https://f3de0bfe86fd.ngrok-free.app/twilio/test-voice`,
+      });
+
+      res.json({
+        success: true,
+        callSid: call.sid,
+        to: phoneNumber,
+        from: TWILIO_PHONE_NUMBER,
+      });
+    } catch (error) {
+      console.error("Test call error:", error);
+      res.status(500).json({
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  })();
+
+  return; // Explicit return to satisfy TypeScript
+});
+
+// Test voice endpoint for direct calls
+app.post("/twilio/test-voice", (req: Request, res: Response) => {
+  const resp = new VoiceResponse();
+  resp.say(
+    {
+      voice: "Polly.Joanna",
+      language: "en-US",
+    },
+    "<speak>This is a test call from Eldrix. If you can hear this, your phone number is working correctly!</speak>"
+  );
+  resp.hangup();
+  res.type("text/xml").send(resp.toString());
+});
+
+// Simple test endpoint to generate TwiML for dialing
+app.get("/api/test-dial", (req: Request, res: Response) => {
+  const resp = new VoiceResponse();
+
+  console.log(`🧪 TEST DIAL: Creating simple dial to ${FORWARD_NUMBER}`);
+
+  const dial = resp.dial({
+    timeout: 30,
+    action: `https://f3de0bfe86fd.ngrok-free.app/twilio/no-answer`,
+    method: "POST",
+  });
+
+  dial.number(FORWARD_NUMBER);
+
+  console.log(`🧪 TEST DIAL: Generated TwiML:`, resp.toString());
+
+  res.type("text/xml").send(resp.toString());
+});
+
 // 1) Inbound call: IVR menu
 app.post("/twilio/voice", (req: Request, res: Response) => {
   console.log("📞 INCOMING CALL", {
@@ -370,7 +477,10 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
   });
 
   const digits = req.body.Digits;
-  const host = `${req.protocol}://${req.get("host")}`;
+  // Force HTTPS for ngrok URLs to ensure proper Twilio webhook handling
+  const host = req.get("host")?.includes("ngrok")
+    ? `https://${req.get("host")}`
+    : `${req.protocol}://${req.get("host")}`;
   const resp = new VoiceResponse();
 
   // Check if this is a response to the gather with digits
@@ -521,205 +631,207 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
       // Return early to prevent the default response
       return;
     } else if (digits === "2") {
-      // Option 2: Talk to representative
-      const callerNumber = req.body.From || "";
+      // Option 2: Talk to representative - WITH USER LOOKUP
       console.log(
-        `👩‍💼 OPTION 2 SELECTED: Checking account status for caller: ${callerNumber}`
+        `👩‍💼 OPTION 2 SELECTED: Looking up user before forwarding to ${FORWARD_NUMBER}`
       );
 
-      // Make the response async to handle database operations
+      // Make this async to handle database operations
       (async () => {
         try {
+          // Force dynamic URL for Twilio API callbacks
+          const host = req.get("host")?.includes("ngrok")
+            ? `https://${req.get("host")}`
+            : `${req.protocol}://${req.get("host")}`;
+
+          // Get caller's number
+          const callerNumber = req.body.From || "";
+          console.log(`📞 OPTION 2: Caller number: ${callerNumber}`);
+
+          // Look up the user by phone number
           const user = await findUserByPhone(callerNumber);
 
+          // Check for active sessions and session count
+          let whisperType = "unknown";
+          let whisperName = "";
+          let existingSessionId = null;
+          let isActiveSession = false;
+          let reachedSessionLimit = false;
+
           if (user) {
-            // User found - check their session count
+            // Registered user found - check their session count
             const sessionCount = await countUserSessions(user.id);
+            const remainingSessions = 3 - sessionCount;
+
+            console.log(
+              `✅ Found registered user: ${user.name} (${sessionCount}/3 sessions used)`
+            );
 
             if (sessionCount >= 3) {
               // User has used all their monthly sessions
               console.log(`⛔ USER ${user.name} HAS REACHED SESSION LIMIT`);
+              reachedSessionLimit = true;
 
-              // Send SMS notification to admin
-              await sendSmsNotification(
-                "blocked (session limit)",
-                callerNumber,
-                `User: ${user.name}, Used all 3 monthly sessions`
-              );
-
+              // Prepare response for users who hit their session limit
               resp.say(
                 {
                   voice: "Polly.Joanna",
                   language: "en-US",
                 },
-                "<speak>I'm sorry, but you've used all 3 of your help sessions for this month. <break time='300ms'/> Please check back next month for more available sessions. <break time='200ms'/> Thank you for using Eldrix!</speak>"
+                `<speak>Hello ${user.name}! <break time='200ms'/> You have used all 3 of your help sessions for this month. <break time='300ms'/> Please check back next month for more available sessions. <break time='300ms'/> Goodbye!</speak>`
               );
+
               resp.hangup();
-            } else {
-              // User has sessions remaining - create help session and connect the call
-              console.log(
-                `✅ CONNECTING REGISTERED USER: ${user.name} (${sessionCount}/3 sessions used)`
+              res.type("text/xml").send(resp.toString());
+
+              // Send SMS notification to admin
+              await sendSmsNotification(
+                "denied due to session limit",
+                callerNumber,
+                `${user.name} tried to call but has used all 3 monthly sessions`
               );
 
-              // Check for existing active session before creating a new one
-              let helpSessionId: string | null = null;
-              try {
-                // Check for an existing active (uncompleted) session of ANY type for this user
-                const [existingSessions]: [any[], any] = await dbPool.execute(
-                  "SELECT * FROM HelpSession WHERE userId = ? AND completed = 0 ORDER BY createdAt DESC LIMIT 1",
-                  [user.id]
+              // Return early - don't forward this call
+              return;
+            }
+
+            // Check for existing active session
+            try {
+              const [sessions]: [any[], any] = await dbPool.execute(
+                "SELECT * FROM HelpSession WHERE userId = ? AND completed = 0 ORDER BY createdAt DESC LIMIT 1",
+                [user.id]
+              );
+
+              // Filter for sessions with active statuses
+              const incompleteSessions = Array.isArray(sessions)
+                ? sessions.filter(
+                    (session) =>
+                      session.status === "pending" ||
+                      session.status === "active" ||
+                      session.status === "ongoing" ||
+                      session.status === "open"
+                  )
+                : [];
+
+              if (incompleteSessions.length > 0) {
+                // Found existing active session
+                existingSessionId = incompleteSessions[0].id;
+                isActiveSession = true;
+                console.log(
+                  `🔄 Found existing active session ${existingSessionId} for user ${user.name}`
                 );
-
-                // Filter for sessions with active statuses
-                const incompleteSessions = existingSessions.filter(
-                  (session) =>
-                    session.status === "pending" ||
-                    session.status === "active" ||
-                    session.status === "ongoing" ||
-                    session.status === "open"
-                );
-
-                if (incompleteSessions.length > 0) {
-                  // Found an existing active session - use it and update type if needed
-                  const existingSession = incompleteSessions[0];
-                  helpSessionId = existingSession.id;
-
-                  // Check if we need to update the session type
-                  if (existingSession.type !== "phone") {
-                    console.log(
-                      `🔄 Switching session ${helpSessionId} from ${existingSession.type} to phone for user ${user.name}`
-                    );
-
-                    // Update the session type to phone
-                    await dbPool.execute(
-                      "UPDATE HelpSession SET type = 'phone', updatedAt = ? WHERE id = ?",
-                      [new Date(), helpSessionId]
-                    );
-                  }
-
-                  console.log(
-                    `✅ Found existing session ${helpSessionId} for user ${user.name} - continuing conversation via phone`
-                  );
-                } else {
-                  // No existing active session found - create a new one
-                  console.log(
-                    `📝 No active session found - creating new phone session for user ${user.name}`
-                  );
-                  helpSessionId = await createHelpSession(user.id, "phone");
-                  if (helpSessionId) {
-                    console.log(
-                      `✅ Created new help session ${helpSessionId} for user ${user.name}`
-                    );
-                  } else {
-                    console.error(
-                      `⚠️ Failed to create help session for user ${user.name}`
-                    );
-                  }
-                }
-              } catch (sessionError) {
-                console.error("Error managing help session:", sessionError);
               }
-
-              // Use just the phone number for callerId (most compatible with carriers)
-              // But add a whisper message that plays before connecting to identify the caller
-              console.log(
-                `📱 CONNECTING CALL: Registered user ${user.name} to representative at ${FORWARD_NUMBER}`
-              );
-              console.log(
-                `📊 SESSION INFO: User has used ${sessionCount} out of 3 monthly sessions`
-              );
-              console.log(
-                `📋 USER DETAILS: Tech usage: ${
-                  user.techUsage || "not specified"
-                }, Experience: ${user.experienceLevel || "beginner"}`
-              );
-
-              const dial = resp.dial({
-                callerId: callerNumber,
-                timeout: 30,
-                action: `${host}/twilio/no-answer`,
-                method: "POST",
-              });
-
-              // Add a number with a whisper URL that will play a message to you before connecting
-              dial.number(
-                {
-                  url: `${host}/twilio/whisper?type=customer&name=${encodeURIComponent(
-                    user.name || "registered"
-                  )}`,
-                },
-                FORWARD_NUMBER
+            } catch (sessionError) {
+              console.error(
+                "Error checking for active sessions:",
+                sessionError
               );
             }
+
+            // If we get here, user has sessions remaining
+            whisperType = "customer";
+            whisperName = user.name;
+
+            // If this isn't an existing active session, create a new one for phone support
+            if (!isActiveSession) {
+              try {
+                const helpSessionId = await createHelpSession(user.id, "phone");
+                console.log(
+                  `📝 Created new help session ${helpSessionId} for phone support with ${user.name}`
+                );
+              } catch (createError) {
+                console.error("Error creating help session:", createError);
+              }
+            }
           } else {
-            // No user found - check if they've used a free trial before
+            // Check if they've used a free trial
             const freeTrialUsed = await hasUsedFreeTrial(callerNumber);
-
-            if (freeTrialUsed) {
-              // Already used free trial - inform the caller
-              console.log("⛔ FREE TRIAL ALREADY USED: Denying free trial");
-
-              // Send SMS notification to admin
-              await sendSmsNotification(
-                "denied free trial (already used)",
-                callerNumber,
-                "Caller already used their free trial and tried again"
-              );
-
-              resp.say(
-                {
-                  voice: "Polly.Joanna",
-                  language: "en-US",
-                },
-                "<speak>We notice you've already used a free trial call with us. <break time='300ms'/> To create an account and get regular access, please visit our website at eldrix.app. <break time='300ms'/> Thank you for your interest in our services. <break time='200ms'/> Goodbye!</speak>"
-              );
-              resp.hangup();
+            if (!freeTrialUsed) {
+              // Eligible for free trial - record it
+              await recordFreeTrial(callerNumber);
+              whisperType = "freetrial";
+              console.log(`🆓 New user eligible for free trial`);
             } else {
-              // Eligible for free trial - offer it
-              console.log("🆓 NEW USER: Offering free trial call");
-
-              // Add a gather to confirm they want the free trial
-              const gather = resp.gather({
-                numDigits: 1,
-                action: `${host}/twilio/free-trial`,
-                method: "POST",
-              });
-
-              gather.say(
-                {
-                  voice: "Polly.Joanna",
-                  language: "en-US",
-                },
-                "<speak>We don't have an account with your phone number yet. <break time='300ms'/> We're offering you a free trial call with our representative. <break time='300ms'/> Press 1 to continue with your free trial call. <break time='200ms'/> Press 2 to end the call.</speak>"
+              whisperType = "returning";
+              console.log(
+                `⚠️ Returning non-registered user (already used free trial)`
               );
-
-              // If no input received
-              resp.say(
-                {
-                  voice: "Polly.Joanna",
-                  language: "en-US",
-                },
-                "<speak>No input received. <break time='200ms'/> Goodbye!</speak>"
-              );
-              resp.hangup();
             }
           }
 
-          res.type("text/xml").send(resp.toString());
-        } catch (error) {
-          console.error(
-            "Error in account lookup for representative connection:",
-            error
+          // Set up whisper URL with user info and session status
+          const whisperParams = new URLSearchParams({
+            type: whisperType,
+            name: whisperName,
+            activeSession: isActiveSession ? "true" : "false",
+            sessionId: existingSessionId || "",
+          }).toString();
+
+          const whisperUrl = `${host}/twilio/whisper?${whisperParams}`;
+          console.log(`💬 WHISPER URL: ${whisperUrl}`);
+
+          // Build the response with whisper and recording enabled
+          // Note: For machine detection, we'll need to use call creation API instead,
+          // as TwiML doesn't support all machine detection features
+          const dial = resp.dial({
+            timeout: 20, // Shorter timeout to avoid long waits
+            callerId: TWILIO_PHONE_NUMBER,
+            action: `${host}/twilio/no-answer`,
+            method: "POST",
+            record: "record-from-answer", // Start recording when the call is answered
+            recordingStatusCallback: `${host}/twilio/recording-status?originalCaller=${encodeURIComponent(
+              callerNumber
+            )}&userId=${encodeURIComponent(user?.id || "")}`,
+            recordingStatusCallbackMethod: "POST",
+            // Machine detection is handled in the no-answer endpoint
+          });
+
+          // Use the number with whisper URL
+          dial.number(
+            {
+              statusCallbackEvent: [
+                "initiated",
+                "ringing",
+                "answered",
+                "completed",
+              ],
+              statusCallback: `${host}/twilio/call-status`,
+              statusCallbackMethod: "POST",
+              url: whisperUrl,
+            },
+            FORWARD_NUMBER
           );
 
-          // In case of error, connect the call anyway
-          console.log("⚠️ ERROR DURING LOOKUP: Connecting call as fallback");
-          resp.dial(
+          console.log(
+            `🔧 FORWARDING WITH WHISPER: TwiML generated:`,
+            resp.toString()
+          );
+          res.type("text/xml").send(resp.toString());
+        } catch (error) {
+          console.error("Error during user lookup for call forwarding:", error);
+
+          // In case of error, fall back to simple forwarding
+          console.log(
+            `⚠️ Error during user lookup - falling back to simple forwarding`
+          );
+
+          const dial = resp.dial({
+            timeout: 30,
+            callerId: TWILIO_PHONE_NUMBER,
+            action: `${host}/twilio/no-answer`,
+            method: "POST",
+          });
+
+          dial.number(
             {
-              callerId: `CUSTOMER - ${callerNumber}`,
-              timeout: 30,
-              action: `${host}/twilio/no-answer`,
-              method: "POST",
+              statusCallbackEvent: [
+                "initiated",
+                "ringing",
+                "answered",
+                "completed",
+              ],
+              statusCallback: `${host}/twilio/call-status`,
+              statusCallbackMethod: "POST",
             },
             FORWARD_NUMBER
           );
@@ -794,21 +906,69 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
 // 2) Process DTMF input is now handled directly in the /twilio/voice endpoint
 
 // 3) No‑answer handler: play a quick message then hang up
+app.get("/twilio/no-answer", (req: Request, res: Response) => {
+  console.log("📵 NO ANSWER GET REQUEST (webhook verification)");
+  res.status(200).send("OK");
+});
+
 app.post("/twilio/no-answer", (req: Request, res: Response) => {
-  console.log("📵 NO ANSWER", {
+  console.log("📵 CALL COMPLETION HANDLER TRIGGERED", {
     callSid: req.body.CallSid,
     dialStatus: req.body.DialCallStatus,
+    dialCallSid: req.body.DialCallSid,
+    dialCallStatus: req.body.DialCallStatus,
+    dialCallDuration: req.body.DialCallDuration,
     timestamp: new Date().toISOString(),
   });
 
+  const dialStatus = req.body.DialCallStatus;
+  const dialDuration = parseInt(req.body.DialCallDuration || "0", 10);
+  const machineDetection = req.body.AnsweringMachineDetection;
   const resp = new VoiceResponse();
-  resp.say(
-    {
-      voice: "Polly.Joanna",
-      language: "en-US",
-    },
-    "<speak>Sorry, we couldn't reach our representative at this time. <break time='300ms'/> We'll call you back as soon as possible. <break time='200ms'/> Thank you for contacting Eldrix!</speak>"
-  );
+
+  console.log(`📞 MACHINE DETECTION: ${machineDetection || "not detected"}`);
+
+  // Check for answering machine/voicemail
+  if (machineDetection === "machine") {
+    // Handle voicemail scenario
+    console.log("🤖 VOICEMAIL DETECTED: Leaving a message");
+
+    resp.say(
+      {
+        voice: "Polly.Joanna",
+        language: "en-US",
+      },
+      "<speak>Hello, this is Eldrix calling. We received your call but couldn't reach you. Please call us back during business hours or send us a text message for faster support. Thank you!</speak>"
+    );
+    resp.hangup();
+  }
+  // Check if the call was actually answered and completed (normal hang up)
+  else if (dialStatus === "completed" && dialDuration > 0) {
+    // Call was answered and completed normally - thank them
+    console.log(
+      "✅ CALL COMPLETED NORMALLY: Duration " + dialDuration + " seconds"
+    );
+
+    resp.say(
+      {
+        voice: "Polly.Joanna",
+        language: "en-US",
+      },
+      "<speak>Thank you for your call to Eldrix. <break time='300ms'/> Your support session will remain active for 30 minutes in case you need to call back. <break time='200ms'/> Have a great day!</speak>"
+    );
+  } else {
+    // Call was not answered or failed
+    console.log("❌ CALL NOT ANSWERED: Status " + dialStatus);
+
+    resp.say(
+      {
+        voice: "Polly.Joanna",
+        language: "en-US",
+      },
+      "<speak>Sorry, we couldn't reach our representative at this time. <break time='300ms'/> We'll call you back as soon as possible. <break time='200ms'/> For faster responses, please try texting us instead. <break time='200ms'/> Thank you for contacting Eldrix!</speak>"
+    );
+  }
+
   resp.hangup();
   res.type("text/xml").send(resp.toString());
 });
@@ -817,7 +977,10 @@ app.post("/twilio/no-answer", (req: Request, res: Response) => {
 app.post("/twilio/free-trial", (req: Request, res: Response) => {
   const digits = req.body.Digits;
   const callerNumber = req.body.From || "";
-  const host = `${req.protocol}://${req.get("host")}`;
+  // Force HTTPS for ngrok URLs to ensure proper Twilio webhook handling
+  const host = req.get("host")?.includes("ngrok")
+    ? `https://${req.get("host")}`
+    : `${req.protocol}://${req.get("host")}`;
 
   console.log("🎁 FREE TRIAL RESPONSE", {
     callSid: req.body.CallSid,
@@ -879,19 +1042,15 @@ app.post("/twilio/free-trial", (req: Request, res: Response) => {
           // Use just the phone number for callerId (most compatible with carriers)
           // But add a whisper message that plays before connecting to identify the caller
           const dial = resp.dial({
-            callerId: callerNumber,
+            // Remove callerId to avoid carrier blocking issues
             timeout: 30,
             action: `${host}/twilio/no-answer`,
             method: "POST",
           });
 
           // Add a number with a whisper URL that will play a message to you before connecting
-          dial.number(
-            {
-              url: `${host}/twilio/whisper?type=freetrial`,
-            },
-            FORWARD_NUMBER
-          );
+          // Temporarily disable whisper to test if that's causing the issue
+          dial.number(FORWARD_NUMBER);
         }
       } else if (digits === "2") {
         // User explicitly declined
@@ -960,34 +1119,42 @@ app.post("/twilio/free-trial", (req: Request, res: Response) => {
 app.post("/twilio/whisper", (req: Request, res: Response) => {
   const type = req.query.type as string;
   const name = req.query.name as string;
+  const activeSession = req.query.activeSession === "true";
+  const sessionId = (req.query.sessionId as string) || "";
+  const callerNumber = req.body.From || "(unknown)";
+  const formattedPhone = callerNumber.replace(/^\+1/, ""); // Remove +1 for display
 
-  console.log("💬 WHISPER", { type, name });
-  console.log(
-    `📞 WHISPER PREPARING CALL: Starting 5-second countdown for call to ${FORWARD_NUMBER}`
-  );
-  console.log(
-    `⏱️ COUNTDOWN STARTED: Call will connect to ${FORWARD_NUMBER} in 5 seconds...`
-  );
+  console.log("💬 WHISPER", {
+    type,
+    name,
+    callerNumber,
+    activeSession,
+    sessionId,
+  });
+  console.log(`📞 WHISPER PREPARING CALL: Connecting to ${FORWARD_NUMBER}`);
 
   const resp = new VoiceResponse();
 
   if (type === "customer") {
     // Registered customer
+    // Add different message based on active session status
+    let sessionInfo = "";
+    if (activeSession) {
+      sessionInfo = `This is a continuation of an existing session.`;
+    } else {
+      sessionInfo = `This is a new support session.`;
+    }
+
     resp.say(
       {
         voice: "Polly.Joanna",
         language: "en-US",
       },
       `<speak>
-        Incoming call from customer ${name || "with account"}. 
-        <break time="1s"/>
-        Connecting in 5 seconds.
-        <break time="1s"/> 
-        5... <break time="1s"/> 
-        4... <break time="1s"/> 
-        3... <break time="1s"/> 
-        2... <break time="1s"/> 
-        1... <break time="1s"/>
+        Incoming call from registered customer ${name || "with account"}.
+        <break time="500ms"/>
+        ${sessionInfo}
+        <break time="500ms"/>
         Connecting now.
       </speak>`
     );
@@ -999,20 +1166,30 @@ app.post("/twilio/whisper", (req: Request, res: Response) => {
         language: "en-US",
       },
       `<speak>
-        Incoming call from free trial customer. 
-        <break time="1s"/>
-        Connecting in 5 seconds.
-        <break time="1s"/> 
-        5... <break time="1s"/> 
-        4... <break time="1s"/> 
-        3... <break time="1s"/> 
-        2... <break time="1s"/> 
-        1... <break time="1s"/>
+        Incoming call from new free trial customer.
+        <break time="500ms"/>
+        This is their first call.
+        <break time="500ms"/>
+        Connecting now.
+      </speak>`
+    );
+  } else if (type === "returning") {
+    // Returning non-registered customer
+    resp.say(
+      {
+        voice: "Polly.Joanna",
+        language: "en-US",
+      },
+      `<speak>
+        Incoming call from returning customer without active subscription.
+        <break time="500ms"/>
+        They've already used their free trial.
+        <break time="500ms"/>
         Connecting now.
       </speak>`
     );
   } else {
-    // Default
+    // Default/unknown
     resp.say(
       {
         voice: "Polly.Joanna",
@@ -1020,14 +1197,9 @@ app.post("/twilio/whisper", (req: Request, res: Response) => {
       },
       `<speak>
         Incoming customer call.
-        <break time="1s"/>
-        Connecting in 5 seconds.
-        <break time="1s"/> 
-        5... <break time="1s"/> 
-        4... <break time="1s"/> 
-        3... <break time="1s"/> 
-        2... <break time="1s"/> 
-        1... <break time="1s"/>
+        <break time="500ms"/>
+        Status: unknown.
+        <break time="500ms"/>
         Connecting now.
       </speak>`
     );
@@ -1472,7 +1644,260 @@ app.post("/twilio/sms-reply", (req: Request, res: Response) => {
   })();
 });
 
-// 8) SMS response handler for external API integration
+// 8) Call status tracking endpoint
+app.post("/twilio/call-status", (req: Request, res: Response) => {
+  console.log("📞 CALL STATUS UPDATE", {
+    callSid: req.body.CallSid,
+    callStatus: req.body.CallStatus,
+    from: req.body.From,
+    to: req.body.To,
+    direction: req.body.Direction,
+    timestamp: new Date().toISOString(),
+  });
+
+  // This endpoint just logs the status and responds with 200 OK
+  res.status(200).send("OK");
+});
+
+// Helper function to download a file from a URL to a local temp file
+async function downloadFileFromUrl(
+  url: string,
+  authUsername?: string,
+  authPassword?: string
+): Promise<string> {
+  try {
+    const tempFilePath = path.join(
+      os.tmpdir(),
+      `twilio_recording_${Date.now()}.wav`
+    );
+    console.log(`📥 Downloading file from ${url} to ${tempFilePath}`);
+
+    const response = await axios({
+      method: "GET",
+      url: url,
+      responseType: "stream",
+      auth:
+        authUsername && authPassword
+          ? {
+              username: authUsername,
+              password: authPassword,
+            }
+          : undefined,
+    });
+
+    const streamPipeline = promisify(pipeline);
+    const writer = createWriteStream(tempFilePath);
+    await streamPipeline(response.data, writer);
+
+    console.log(`✅ Download complete: ${tempFilePath}`);
+    return tempFilePath;
+  } catch (error) {
+    console.error("Error downloading file:", error);
+    throw error;
+  }
+}
+
+// Helper function to upload a file to S3
+async function uploadFileToS3(
+  filePath: string,
+  key: string,
+  contentType: string = "audio/wav"
+): Promise<string> {
+  try {
+    console.log(`📤 Uploading file to S3: ${key}`);
+
+    const fileContent = fs.readFileSync(filePath);
+
+    const uploadParams = {
+      Bucket: AWS_BUCKET_NAME,
+      Key: key,
+      Body: fileContent,
+      ContentType: contentType,
+    };
+
+    await s3Client.send(new PutObjectCommand(uploadParams));
+
+    // Generate the S3 URL
+    const s3Url = `https://${AWS_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+    console.log(`✅ Upload complete: ${s3Url}`);
+
+    return s3Url;
+  } catch (error) {
+    console.error("Error uploading to S3:", error);
+    throw error;
+  } finally {
+    // Clean up temp file
+    try {
+      fs.unlinkSync(filePath);
+      console.log(`🧹 Cleaned up temp file: ${filePath}`);
+    } catch (cleanupError) {
+      console.error("Error cleaning up temp file:", cleanupError);
+    }
+  }
+}
+
+// 9) Recording status callback - handles recording notifications
+app.post("/twilio/recording-status", (req: Request, res: Response) => {
+  console.log("🎙️ RECORDING STATUS UPDATE", {
+    recordingSid: req.body.RecordingSid,
+    recordingStatus: req.body.RecordingStatus,
+    recordingUrl: req.body.RecordingUrl,
+    recordingDuration: req.body.RecordingDuration,
+    recordingChannels: req.body.RecordingChannels,
+    callSid: req.body.CallSid,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Respond quickly to Twilio - we'll process async
+  res.status(200).send("OK");
+
+  // Associate recording with help session if we can find one
+  (async () => {
+    try {
+      // Use the original caller number from query params instead of the From field
+      const callerNumber =
+        (req.query.originalCaller as string) || req.body.From || "";
+      const userId = req.query.userId as string;
+      const recordingUrl = req.body.RecordingUrl;
+      const recordingSid = req.body.RecordingSid;
+      const recordingDuration = req.body.RecordingDuration;
+      const recordingStatus = req.body.RecordingStatus;
+
+      // Only proceed if we have a valid recording URL and it's completed
+      if (recordingUrl && recordingSid && recordingStatus === "completed") {
+        console.log(`🎵 Processing completed recording: ${recordingSid}`);
+
+        let s3Url = "";
+
+        try {
+          // Download the recording from Twilio
+          // Note: Some Twilio recordings require authentication with AccountSid:AuthToken
+          const localFilePath = await downloadFileFromUrl(
+            recordingUrl,
+            TWILIO_ACCOUNT_SID,
+            TWILIO_AUTH_TOKEN
+          );
+
+          // Upload to S3
+          const s3Key = `call-recordings/${recordingSid}_${new Date()
+            .toISOString()
+            .replace(/[:.]/g, "-")}.wav`;
+          s3Url = await uploadFileToS3(localFilePath, s3Key);
+
+          console.log(`🎉 Recording saved to S3: ${s3Url}`);
+        } catch (storageError) {
+          console.error("Error saving recording to S3:", storageError);
+          // Continue with the original Twilio URL if S3 upload fails
+          s3Url = "";
+        }
+
+        // Find user either by ID (if passed) or by phone number
+        let user = null;
+
+        if (userId) {
+          // Try to get user directly by ID first if we have it
+          try {
+            const [users]: [any[], any] = await dbPool.execute(
+              "SELECT * FROM User WHERE id = ?",
+              [userId]
+            );
+
+            if (Array.isArray(users) && users.length > 0) {
+              user = users[0];
+              console.log(`✅ Found user by ID: ${user.name}`);
+            }
+          } catch (idLookupError) {
+            console.error("Error looking up user by ID:", idLookupError);
+          }
+        }
+
+        // Fall back to phone lookup if we don't have a user yet
+        if (!user && callerNumber) {
+          user = await findUserByPhone(callerNumber);
+        }
+
+        if (user) {
+          // Find most recent active session for this user
+          const [sessions]: [any[], any] = await dbPool.execute(
+            "SELECT * FROM HelpSession WHERE userId = ? AND type = 'phone' ORDER BY createdAt DESC LIMIT 1",
+            [user.id]
+          );
+
+          if (Array.isArray(sessions) && sessions.length > 0) {
+            const sessionId = sessions[0].id;
+
+            // Store recording details in the session
+            // Create a message with both recording URLs
+            const messageText = s3Url
+              ? `📞 Call recording: ${s3Url} (Duration: ${
+                  recordingDuration || "unknown"
+                } seconds)\n\nTwilio original: ${recordingUrl}`
+              : `📞 Call recording: ${recordingUrl} (Duration: ${
+                  recordingDuration || "unknown"
+                } seconds)`;
+
+            await createMessage(
+              sessionId,
+              messageText,
+              true // Mark as from admin
+            );
+
+            console.log(
+              `✅ Saved recording URL to help session ${sessionId} for user ${user.name}`
+            );
+
+            // Send notification to admin with recording link
+            const notificationText = s3Url
+              ? `ELDRIX CALL RECORDING: Call with ${
+                  user.name
+                } (${callerNumber}) was recorded.\n\nDuration: ${
+                  recordingDuration || "unknown"
+                } seconds\n\nS3 Recording URL: ${s3Url}\n\nTwilio URL: ${recordingUrl}\n\nSession ID: ${sessionId}`
+              : `ELDRIX CALL RECORDING: Call with ${
+                  user.name
+                } (${callerNumber}) was recorded.\n\nDuration: ${
+                  recordingDuration || "unknown"
+                } seconds\n\nRecording URL: ${recordingUrl}\n\nSession ID: ${sessionId}`;
+
+            await client.messages.create({
+              body: notificationText,
+              from: TWILIO_PHONE_NUMBER,
+              to: ADMIN_PHONE,
+            });
+          } else {
+            console.log(
+              `⚠️ No recent phone session found for user ${user.name} to attach recording`
+            );
+          }
+        } else {
+          // Unknown user, still send notification to admin
+          console.log(
+            `⚠️ Unknown user for call recording from ${callerNumber}`
+          );
+
+          // Send notification to admin with recording link
+          const notificationText = s3Url
+            ? `ELDRIX CALL RECORDING: Call with unknown user (${callerNumber}) was recorded.\n\nDuration: ${
+                recordingDuration || "unknown"
+              } seconds\n\nS3 Recording URL: ${s3Url}\n\nTwilio URL: ${recordingUrl}`
+            : `ELDRIX CALL RECORDING: Call with unknown user (${callerNumber}) was recorded.\n\nDuration: ${
+                recordingDuration || "unknown"
+              } seconds\n\nRecording URL: ${recordingUrl}`;
+
+          await client.messages.create({
+            body: notificationText,
+            from: TWILIO_PHONE_NUMBER,
+            to: ADMIN_PHONE,
+          });
+        }
+      }
+    } catch (error) {
+      console.error("Error processing recording status:", error);
+    }
+  })();
+});
+
+// 10) SMS response handler for external API integration
 app.post("/twilio/sms/respond", (req: Request, res: Response) => {
   console.log("📱 SMS RESPOND API CALL", {
     sessionId: req.body.sessionId,

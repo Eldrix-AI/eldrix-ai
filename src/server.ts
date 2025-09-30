@@ -2,10 +2,10 @@
 import express, { Request, Response } from "express";
 import dotenv from "dotenv";
 import Twilio from "twilio";
-import mysql from "mysql2/promise";
+import { Pool } from "pg";
 import { v4 as uuidv4 } from "uuid";
 import axios from "axios";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { put } from "@vercel/blob";
 import { createWriteStream } from "fs";
 import { promisify } from "util";
 import { pipeline } from "stream";
@@ -32,11 +32,8 @@ const {
   DB_PORT,
   DATABASE_URL,
 
-  // AWS configuration for S3 storage
-  AWS_ACCESS_KEY_ID,
-  AWS_SECRET_ACCESS_KEY,
-  AWS_REGION = "us-east-2",
-  AWS_BUCKET_NAME = "deepskygallery",
+  // Vercel Blob configuration
+  BLOB_READ_WRITE_TOKEN,
 
   // Stripe configuration
   STRIPE_SECRET_KEY,
@@ -59,45 +56,46 @@ const client = Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const { VoiceResponse, MessagingResponse } = Twilio.twiml;
 const app = express();
 
-// Configure the AWS S3 client
-const s3Client = new S3Client({
-  region: AWS_REGION,
-  credentials: {
-    accessKeyId: AWS_ACCESS_KEY_ID!,
-    secretAccessKey: AWS_SECRET_ACCESS_KEY!,
-  },
-});
+// Vercel Blob is configured via environment variable
 
 // Create database connection pool using DATABASE_URL or individual parameters
-let dbPool: mysql.Pool;
+let dbPool: Pool;
 try {
   if (DATABASE_URL) {
     // Use connection string if available
     console.log("Connecting to database using DATABASE_URL");
-    dbPool = mysql.createPool(DATABASE_URL);
+    dbPool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: {
+        rejectUnauthorized: false,
+      },
+    });
   } else if (DB_HOST && DB_USER && DB_PASSWORD && DB_NAME) {
     // Use individual parameters
     console.log("Connecting to database using individual credentials");
-    dbPool = mysql.createPool({
+    dbPool = new Pool({
       host: DB_HOST,
       user: DB_USER,
       password: DB_PASSWORD,
       database: DB_NAME,
-      port: DB_PORT ? parseInt(DB_PORT, 10) : 3306,
-      waitForConnections: true,
-      connectionLimit: 10,
-      queueLimit: 0,
+      port: DB_PORT ? parseInt(DB_PORT, 10) : 5432,
+      ssl: {
+        rejectUnauthorized: false,
+      },
+      max: 10,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 2000,
     });
   } else {
     // Create a placeholder pool that will throw errors when used
     console.error(
       "No database credentials provided. Database functionality will be unavailable."
     );
-    dbPool = {} as mysql.Pool;
+    dbPool = {} as Pool;
   }
 } catch (error) {
   console.error("Error creating database pool:", error);
-  dbPool = {} as mysql.Pool;
+  dbPool = {} as Pool;
 }
 
 // Helper function to clean phone numbers (remove +1, dashes, parentheses, etc.)
@@ -125,15 +123,16 @@ async function findUserByPhone(phone: string): Promise<User | null> {
     );
 
     // Check if dbPool is properly initialized
-    if (!dbPool || !dbPool.execute) {
+    if (!dbPool || !dbPool.query) {
       console.error("⚠️ ERROR - Database pool is not properly initialized!");
       return null;
     }
 
-    const [rows]: [any[], any] = await dbPool.execute(
-      "SELECT * FROM User WHERE phone LIKE ?",
+    const result = await dbPool.query(
+      'SELECT * FROM "User" WHERE phone LIKE $1',
       [`%${cleanedPhone}%`]
     );
+    const rows = result.rows;
 
     if (Array.isArray(rows) && rows.length > 0) {
       const user = rows[0] as User;
@@ -173,10 +172,11 @@ async function countUserSessions(userId: string) {
 
     // Query that only counts COMPLETED sessions from the current month
     // Exclude active sessions (completed = 0) since they don't count against the limit
-    const [rows] = await dbPool.execute(
-      "SELECT COUNT(*) as count FROM HelpSession WHERE userId = ? AND createdAt >= ? AND createdAt < ? AND completed = 1",
+    const result = await dbPool.query(
+      'SELECT COUNT(*) as count FROM "HelpSession" WHERE "userId" = $1 AND "createdAt" >= $2 AND "createdAt" < $3 AND completed = 1',
       [userId, firstDayFormatted, nextMonthFormatted]
     );
+    const rows = result.rows;
 
     if (Array.isArray(rows) && rows.length > 0) {
       const count = (rows[0] as any).count;
@@ -202,10 +202,11 @@ async function hasUsedFreeTrial(phone: string): Promise<boolean> {
   console.log(`🔍 Checking if phone ${cleanedPhone} has used free trial`);
 
   try {
-    const [rows]: [any[], any] = await dbPool.execute(
-      "SELECT * FROM FreeTrial WHERE phone LIKE ?",
+    const result = await dbPool.query(
+      'SELECT * FROM "FreeTrial" WHERE phone LIKE $1',
       [`%${cleanedPhone}%`]
     );
+    const rows = result.rows;
 
     const hasUsed = Array.isArray(rows) && rows.length > 0;
     console.log(
@@ -229,9 +230,10 @@ async function recordFreeTrial(phone: string): Promise<boolean> {
   console.log(`📝 Recording free trial for phone ${cleanedPhone}`);
 
   try {
-    await dbPool.execute("INSERT IGNORE INTO FreeTrial (phone) VALUES (?)", [
-      cleanedPhone,
-    ]);
+    await dbPool.query(
+      'INSERT INTO "FreeTrial" (phone) VALUES ($1) ON CONFLICT (phone) DO NOTHING',
+      [cleanedPhone]
+    );
 
     console.log(`✅ Successfully recorded free trial for ${cleanedPhone}`);
     return true;
@@ -252,10 +254,11 @@ async function reportStripeUsage(
 
   try {
     // Get user's Stripe data
-    const [userRows]: [any[], any] = await dbPool.execute(
-      "SELECT stripeCustomerId, stripeUsageId, stripeSubscriptionId FROM User WHERE id = ?",
+    const userResult = await dbPool.query(
+      'SELECT "stripeCustomerId", "stripeUsageId", "stripeSubscriptionId" FROM "User" WHERE id = $1',
       [userId]
     );
+    const userRows = userResult.rows;
 
     if (!Array.isArray(userRows) || userRows.length === 0) {
       console.log(`❌ No user found with ID ${userId}`);
@@ -310,8 +313,8 @@ async function reportStripeUsage(
       // Store usage record in StripeUsage table
       try {
         const usageId = uuidv4();
-        await dbPool.execute(
-          "INSERT INTO StripeUsage (id, userId, stripeUsageId, stripeCustomerId, sessionId, usageType, quantity, unitPrice, totalAmount, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        await dbPool.query(
+          'INSERT INTO "StripeUsage" (id, "userId", "stripeUsageId", "stripeCustomerId", "sessionId", "usageType", quantity, "unitPrice", "totalAmount", status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
           [
             usageId,
             userId,
@@ -368,10 +371,11 @@ async function createHelpSession(
     // Get user data to check subscription status for priority setting
     let priority = "medium"; // Default priority
     try {
-      const [userRows]: [any[], any] = await dbPool.execute(
-        "SELECT stripeSubscriptionId, stripeUsageId, stripeCustomerId FROM User WHERE id = ?",
+      const userResult = await dbPool.query(
+        'SELECT "stripeSubscriptionId", "stripeUsageId", "stripeCustomerId" FROM "User" WHERE id = $1',
         [userId]
       );
+      const userRows = userResult.rows;
 
       if (Array.isArray(userRows) && userRows.length > 0) {
         const userData = userRows[0];
@@ -403,8 +407,8 @@ async function createHelpSession(
     }
 
     // Insert a new help session record with priority based on subscription status
-    await dbPool.execute(
-      "INSERT INTO HelpSession (id, userId, type, title, status, priority, createdAt, updatedAt, lastMessage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    await dbPool.query(
+      'INSERT INTO "HelpSession" (id, "userId", type, title, status, priority, "createdAt", "updatedAt", "lastMessage") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
       [
         sessionId,
         userId,
@@ -453,21 +457,21 @@ async function createMessage(
     const now = new Date(); // Use JavaScript Date object directly, matching the external system
 
     // Insert the message record
-    await dbPool.execute(
-      "INSERT INTO Message (id, content, isAdmin, helpSessionId, createdAt, `read`) VALUES (?, ?, ?, ?, ?, ?)",
+    await dbPool.query(
+      'INSERT INTO "Message" (id, content, "isAdmin", "helpSessionId", "createdAt", read) VALUES ($1, $2, $3, $4, $5, $6)',
       [
         messageId,
         content,
         isAdmin ? 1 : 0,
         helpSessionId,
-        now, // MySQL can accept JavaScript Date objects
+        now, // PostgreSQL can accept JavaScript Date objects
         0, // not read initially
       ]
     );
 
     // Update the lastMessage field in the HelpSession table
-    await dbPool.execute(
-      "UPDATE HelpSession SET lastMessage = ?, updatedAt = ? WHERE id = ?",
+    await dbPool.query(
+      'UPDATE "HelpSession" SET "lastMessage" = $1, "updatedAt" = $2 WHERE id = $3',
       [content, now, helpSessionId]
     );
 
@@ -859,10 +863,11 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
 
             // Check for existing active session
             try {
-              const [sessions]: [any[], any] = await dbPool.execute(
-                "SELECT * FROM HelpSession WHERE userId = ? AND completed = 0 ORDER BY createdAt DESC LIMIT 1",
+              const sessionResult = await dbPool.query(
+                'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND completed = 0 ORDER BY "createdAt" DESC LIMIT 1',
                 [user.id]
               );
+              const sessions = sessionResult.rows;
 
               // Filter for sessions with active statuses
               const incompleteSessions = Array.isArray(sessions)
@@ -898,10 +903,11 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
             if (!isActiveSession) {
               try {
                 // Check if user is on pay-as-you-go plan to prevent multiple sessions
-                const [userRows]: [any[], any] = await dbPool.execute(
-                  "SELECT stripeUsageId, stripeSubscriptionId FROM User WHERE id = ?",
+                const userResult = await dbPool.query(
+                  'SELECT "stripeUsageId", "stripeSubscriptionId" FROM "User" WHERE id = $1',
                   [user.id]
                 );
+                const userRows = userResult.rows;
 
                 const userData = userRows[0];
                 const isPayAsYouGo =
@@ -912,10 +918,11 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
                 if (isPayAsYouGo) {
                   // For pay-as-you-go users, check if they have any recent sessions (within last 24 hours)
                   const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-                  const [recentSessions]: [any[], any] = await dbPool.execute(
-                    "SELECT * FROM HelpSession WHERE userId = ? AND createdAt > ? ORDER BY createdAt DESC LIMIT 1",
+                  const recentResult = await dbPool.query(
+                    'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND "createdAt" > $2 ORDER BY "createdAt" DESC LIMIT 1',
                     [user.id, oneDayAgo]
                   );
+                  const recentSessions = recentResult.rows;
 
                   if (recentSessions.length > 0) {
                     console.log(
@@ -1626,10 +1633,11 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
 
           try {
             // Check for an existing active (uncompleted) session of ANY type for this user
-            const [existingSessions]: [any[], any] = await dbPool.execute(
-              "SELECT * FROM HelpSession WHERE userId = ? AND completed = 0 ORDER BY createdAt DESC LIMIT 1",
+            const existingResult = await dbPool.query(
+              'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND completed = 0 ORDER BY "createdAt" DESC LIMIT 1',
               [user.id]
             );
+            const existingSessions = existingResult.rows;
 
             // Filter for sessions with active statuses
             const incompleteSessions = existingSessions.filter(
@@ -1657,8 +1665,8 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
                 );
 
                 // Update the session type to SMS
-                await dbPool.execute(
-                  "UPDATE HelpSession SET type = 'sms', updatedAt = ? WHERE id = ?",
+                await dbPool.query(
+                  'UPDATE "HelpSession" SET type = \'sms\', "updatedAt" = $1 WHERE id = $2',
                   [new Date(), helpSessionId]
                 );
               }
@@ -1668,10 +1676,11 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
               );
             } else {
               // Check if user is on pay-as-you-go plan to prevent multiple sessions
-              const [userRows]: [any[], any] = await dbPool.execute(
-                "SELECT stripeUsageId, stripeSubscriptionId FROM User WHERE id = ?",
+              const userResult = await dbPool.query(
+                'SELECT "stripeUsageId", "stripeSubscriptionId" FROM "User" WHERE id = $1',
                 [user.id]
               );
+              const userRows = userResult.rows;
 
               const userData = userRows[0];
               const isPayAsYouGo =
@@ -1682,10 +1691,11 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
               if (isPayAsYouGo) {
                 // For pay-as-you-go users, check if they have any recent sessions (within last 24 hours)
                 const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-                const [recentSessions]: [any[], any] = await dbPool.execute(
-                  "SELECT * FROM HelpSession WHERE userId = ? AND createdAt > ? ORDER BY createdAt DESC LIMIT 1",
+                const recentResult = await dbPool.query(
+                  'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND "createdAt" > $2 ORDER BY "createdAt" DESC LIMIT 1',
                   [user.id, oneDayAgo]
                 );
+                const recentSessions = recentResult.rows;
 
                 if (recentSessions.length > 0) {
                   console.log(
@@ -1915,10 +1925,11 @@ app.post("/twilio/sms-reply", (req: Request, res: Response) => {
         // Look for an active help session for this user
         try {
           // Find the most recent active help session for this user (any type)
-          const [sessions]: [any[], any] = await dbPool.execute(
-            "SELECT * FROM HelpSession WHERE userId = ? AND completed = 0 ORDER BY createdAt DESC LIMIT 1",
+          const sessionResult = await dbPool.query(
+            'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND completed = 0 ORDER BY "createdAt" DESC LIMIT 1',
             [user.id]
           );
+          const sessions = sessionResult.rows;
 
           // Filter for sessions with active statuses
           const incompleteSessions = sessions.filter(
@@ -1939,8 +1950,8 @@ app.post("/twilio/sms-reply", (req: Request, res: Response) => {
               );
 
               // Update the session type to SMS
-              await dbPool.execute(
-                "UPDATE HelpSession SET type = 'sms', updatedAt = ? WHERE id = ?",
+              await dbPool.query(
+                'UPDATE "HelpSession" SET type = \'sms\', "updatedAt" = $1 WHERE id = $2',
                 [new Date(), session.id]
               );
             }
@@ -2081,33 +2092,28 @@ async function downloadFileFromUrl(
   }
 }
 
-// Helper function to upload a file to S3
-async function uploadFileToS3(
+// Helper function to upload a file to Vercel Blob
+async function uploadFileToBlob(
   filePath: string,
-  key: string,
+  filename: string,
   contentType: string = "audio/wav"
 ): Promise<string> {
   try {
-    console.log(`📤 Uploading file to S3: ${key}`);
+    console.log(`📤 Uploading file to Vercel Blob: ${filename}`);
 
     const fileContent = fs.readFileSync(filePath);
 
-    const uploadParams = {
-      Bucket: AWS_BUCKET_NAME,
-      Key: key,
-      Body: fileContent,
-      ContentType: contentType,
-    };
+    const blob = await put(filename, fileContent, {
+      access: "public",
+      contentType: contentType,
+      token: BLOB_READ_WRITE_TOKEN,
+    });
 
-    await s3Client.send(new PutObjectCommand(uploadParams));
+    console.log(`✅ Upload complete: ${blob.url}`);
 
-    // Generate the S3 URL
-    const s3Url = `https://${AWS_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
-    console.log(`✅ Upload complete: ${s3Url}`);
-
-    return s3Url;
+    return blob.url;
   } catch (error) {
-    console.error("Error uploading to S3:", error);
+    console.error("Error uploading to Vercel Blob:", error);
     throw error;
   } finally {
     // Clean up temp file
@@ -2151,7 +2157,7 @@ app.post("/twilio/recording-status", (req: Request, res: Response) => {
       if (recordingUrl && recordingSid && recordingStatus === "completed") {
         console.log(`🎵 Processing completed recording: ${recordingSid}`);
 
-        let s3Url = "";
+        let blobUrl = "";
 
         try {
           // Download the recording from Twilio
@@ -2162,17 +2168,17 @@ app.post("/twilio/recording-status", (req: Request, res: Response) => {
             TWILIO_AUTH_TOKEN
           );
 
-          // Upload to S3
-          const s3Key = `call-recordings/${recordingSid}_${new Date()
+          // Upload to Vercel Blob
+          const filename = `call-recordings/${recordingSid}_${new Date()
             .toISOString()
             .replace(/[:.]/g, "-")}.wav`;
-          s3Url = await uploadFileToS3(localFilePath, s3Key);
+          blobUrl = await uploadFileToBlob(localFilePath, filename);
 
-          console.log(`🎉 Recording saved to S3: ${s3Url}`);
+          console.log(`🎉 Recording saved to Vercel Blob: ${blobUrl}`);
         } catch (storageError) {
-          console.error("Error saving recording to S3:", storageError);
-          // Continue with the original Twilio URL if S3 upload fails
-          s3Url = "";
+          console.error("Error saving recording to Vercel Blob:", storageError);
+          // Continue with the original Twilio URL if Blob upload fails
+          blobUrl = "";
         }
 
         // Find user either by ID (if passed) or by phone number
@@ -2181,10 +2187,11 @@ app.post("/twilio/recording-status", (req: Request, res: Response) => {
         if (userId) {
           // Try to get user directly by ID first if we have it
           try {
-            const [users]: [any[], any] = await dbPool.execute(
-              "SELECT * FROM User WHERE id = ?",
+            const userResult = await dbPool.query(
+              'SELECT * FROM "User" WHERE id = $1',
               [userId]
             );
+            const users = userResult.rows;
 
             if (Array.isArray(users) && users.length > 0) {
               user = users[0];
@@ -2202,18 +2209,19 @@ app.post("/twilio/recording-status", (req: Request, res: Response) => {
 
         if (user) {
           // Find most recent active session for this user
-          const [sessions]: [any[], any] = await dbPool.execute(
-            "SELECT * FROM HelpSession WHERE userId = ? AND type = 'phone' ORDER BY createdAt DESC LIMIT 1",
+          const sessionResult = await dbPool.query(
+            'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND type = \'phone\' ORDER BY "createdAt" DESC LIMIT 1',
             [user.id]
           );
+          const sessions = sessionResult.rows;
 
           if (Array.isArray(sessions) && sessions.length > 0) {
             const sessionId = sessions[0].id;
 
             // Store recording details in the session
             // Create a message with both recording URLs
-            const messageText = s3Url
-              ? `📞 Call recording: ${s3Url} (Duration: ${
+            const messageText = blobUrl
+              ? `📞 Call recording: ${blobUrl} (Duration: ${
                   recordingDuration || "unknown"
                 } seconds)\n\nTwilio original: ${recordingUrl}`
               : `📞 Call recording: ${recordingUrl} (Duration: ${
@@ -2231,12 +2239,12 @@ app.post("/twilio/recording-status", (req: Request, res: Response) => {
             );
 
             // Send notification to admin with recording link
-            const notificationText = s3Url
+            const notificationText = blobUrl
               ? `ELDRIX CALL RECORDING: Call with ${
                   user.name
                 } (${callerNumber}) was recorded.\n\nDuration: ${
                   recordingDuration || "unknown"
-                } seconds\n\nS3 Recording URL: ${s3Url}\n\nTwilio URL: ${recordingUrl}\n\nSession ID: ${sessionId}`
+                } seconds\n\nVercel Blob URL: ${blobUrl}\n\nTwilio URL: ${recordingUrl}\n\nSession ID: ${sessionId}`
               : `ELDRIX CALL RECORDING: Call with ${
                   user.name
                 } (${callerNumber}) was recorded.\n\nDuration: ${
@@ -2260,10 +2268,10 @@ app.post("/twilio/recording-status", (req: Request, res: Response) => {
           );
 
           // Send notification to admin with recording link
-          const notificationText = s3Url
+          const notificationText = blobUrl
             ? `ELDRIX CALL RECORDING: Call with unknown user (${callerNumber}) was recorded.\n\nDuration: ${
                 recordingDuration || "unknown"
-              } seconds\n\nS3 Recording URL: ${s3Url}\n\nTwilio URL: ${recordingUrl}`
+              } seconds\n\nVercel Blob URL: ${blobUrl}\n\nTwilio URL: ${recordingUrl}`
             : `ELDRIX CALL RECORDING: Call with unknown user (${callerNumber}) was recorded.\n\nDuration: ${
                 recordingDuration || "unknown"
               } seconds\n\nRecording URL: ${recordingUrl}`;
@@ -2317,10 +2325,11 @@ app.post("/twilio/sms/respond", (req: Request, res: Response) => {
       } else {
         // Look up the user by their actual userId
         try {
-          const [users]: [any[], any] = await dbPool.execute(
-            "SELECT * FROM User WHERE id = ?",
+          const userResult = await dbPool.query(
+            'SELECT * FROM "User" WHERE id = $1',
             [userId]
           );
+          const users = userResult.rows;
 
           if (Array.isArray(users) && users.length > 0) {
             const userObj = users[0] as User;

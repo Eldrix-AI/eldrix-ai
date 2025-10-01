@@ -171,9 +171,9 @@ async function countUserSessions(userId: string) {
     );
 
     // Query that only counts COMPLETED sessions from the current month
-    // Exclude active sessions (completed = 0) since they don't count against the limit
+    // Exclude active sessions (completed = false) since they don't count against the limit
     const result = await dbPool.query(
-      'SELECT COUNT(*) as count FROM "HelpSession" WHERE "userId" = $1 AND "createdAt" >= $2 AND "createdAt" < $3 AND completed = 1',
+      'SELECT COUNT(*) as count FROM "HelpSession" WHERE "userId" = $1 AND "createdAt" >= $2 AND "createdAt" < $3 AND completed = true',
       [userId, firstDayFormatted, nextMonthFormatted]
     );
     const rows = result.rows;
@@ -462,10 +462,10 @@ async function createMessage(
       [
         messageId,
         content,
-        isAdmin ? 1 : 0,
+        isAdmin,
         helpSessionId,
         now, // PostgreSQL can accept JavaScript Date objects
-        0, // not read initially
+        false, // not read initially
       ]
     );
 
@@ -864,7 +864,7 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
             // Check for existing active session
             try {
               const sessionResult = await dbPool.query(
-                'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND completed = 0 ORDER BY "createdAt" DESC LIMIT 1',
+                'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND completed = false ORDER BY "createdAt" DESC LIMIT 1',
                 [user.id]
               );
               const sessions = sessionResult.rows;
@@ -1634,7 +1634,7 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
           try {
             // Check for an existing active (uncompleted) session of ANY type for this user
             const existingResult = await dbPool.query(
-              'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND completed = 0 ORDER BY "createdAt" DESC LIMIT 1',
+              'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND completed = false ORDER BY "createdAt" DESC LIMIT 1',
               [user.id]
             );
             const existingSessions = existingResult.rows;
@@ -1926,7 +1926,7 @@ app.post("/twilio/sms-reply", (req: Request, res: Response) => {
         try {
           // Find the most recent active help session for this user (any type)
           const sessionResult = await dbPool.query(
-            'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND completed = 0 ORDER BY "createdAt" DESC LIMIT 1',
+            'SELECT * FROM "HelpSession" WHERE "userId" = $1 AND completed = false ORDER BY "createdAt" DESC LIMIT 1',
             [user.id]
           );
           const sessions = sessionResult.rows;

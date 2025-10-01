@@ -314,7 +314,7 @@ async function reportStripeUsage(
       try {
         const usageId = uuidv4();
         await dbPool.query(
-          'INSERT INTO "StripeUsage" (id, "userId", "stripeUsageId", "stripeCustomerId", "sessionId", "usageType", quantity, "unitPrice", "totalAmount", status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+          'INSERT INTO "StripeUsage" (id, "userId", "stripeUsageId", "stripeCustomerId", "sessionId", "usageType", quantity, "unitPrice", "totalAmount", status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT ("stripeUsageId") DO NOTHING',
           [
             usageId,
             userId,

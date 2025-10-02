@@ -154,6 +154,76 @@ async function findUserByPhone(phone: string): Promise<User | null> {
   }
 }
 
+// Function to get user's subscription type and session limits
+async function getUserSubscriptionInfo(userId: string): Promise<{
+  subscriptionType: "free" | "pay-as-you-go" | "subscription";
+  sessionLimit: number;
+  hasUnlimitedSessions: boolean;
+  freeSessionsRemaining: number;
+}> {
+  try {
+    // Get user's Stripe data
+    const userResult = await dbPool.query(
+      'SELECT "stripeSubscriptionId", "stripeUsageId", "stripeCustomerId" FROM "User" WHERE id = $1',
+      [userId]
+    );
+    const userRows = userResult.rows;
+
+    if (!Array.isArray(userRows) || userRows.length === 0) {
+      // No user found - treat as free
+      return {
+        subscriptionType: "free",
+        sessionLimit: 3,
+        hasUnlimitedSessions: false,
+        freeSessionsRemaining: 3,
+      };
+    }
+
+    const userData = userRows[0];
+
+    if (userData.stripeSubscriptionId) {
+      // Monthly/Yearly subscription - unlimited sessions
+      return {
+        subscriptionType: "subscription",
+        sessionLimit: -1, // -1 means unlimited
+        hasUnlimitedSessions: true,
+        freeSessionsRemaining: -1,
+      };
+    } else if (userData.stripeUsageId) {
+      // Pay-as-you-go - 3 free sessions, then billing
+      const sessionCount = await countUserSessions(userId);
+      const freeSessionsRemaining = Math.max(0, 3 - sessionCount);
+
+      return {
+        subscriptionType: "pay-as-you-go",
+        sessionLimit: -1, // Unlimited after free sessions
+        hasUnlimitedSessions: true,
+        freeSessionsRemaining: freeSessionsRemaining,
+      };
+    } else {
+      // Free plan - 3 sessions per month
+      const sessionCount = await countUserSessions(userId);
+      const freeSessionsRemaining = Math.max(0, 3 - sessionCount);
+
+      return {
+        subscriptionType: "free",
+        sessionLimit: 3,
+        hasUnlimitedSessions: false,
+        freeSessionsRemaining: freeSessionsRemaining,
+      };
+    }
+  } catch (error) {
+    console.error("Error getting user subscription info:", error);
+    // Default to free plan on error
+    return {
+      subscriptionType: "free",
+      sessionLimit: 3,
+      hasUnlimitedSessions: false,
+      freeSessionsRemaining: 3,
+    };
+  }
+}
+
 // Function to count user's help sessions for the current month
 async function countUserSessions(userId: string) {
   try {
@@ -243,7 +313,7 @@ async function recordFreeTrial(phone: string): Promise<boolean> {
   }
 }
 
-// Function to report usage to Stripe for pay-as-you-go users
+// Function to report usage to Stripe for pay-as-you-go users (only after 3 free sessions)
 async function reportStripeUsage(
   userId: string,
   sessionId: string
@@ -253,6 +323,25 @@ async function reportStripeUsage(
   );
 
   try {
+    // Get user's subscription info to check if they should be billed
+    const subscriptionInfo = await getUserSubscriptionInfo(userId);
+
+    // Only bill pay-as-you-go users who have used their 3 free sessions
+    if (subscriptionInfo.subscriptionType !== "pay-as-you-go") {
+      console.log(
+        `ℹ️ User ${userId} is not on pay-as-you-go plan - skipping usage reporting`
+      );
+      return true; // Not an error, just not applicable
+    }
+
+    // Check if user still has free sessions remaining
+    if (subscriptionInfo.freeSessionsRemaining > 0) {
+      console.log(
+        `ℹ️ User ${userId} still has ${subscriptionInfo.freeSessionsRemaining} free sessions remaining - skipping billing`
+      );
+      return true; // Not an error, just not applicable
+    }
+
     // Get user's Stripe data
     const userResult = await dbPool.query(
       'SELECT "stripeCustomerId", "stripeUsageId", "stripeSubscriptionId" FROM "User" WHERE id = $1',
@@ -267,8 +356,6 @@ async function reportStripeUsage(
 
     const userData = userRows[0];
 
-    // Check if user is on pay-as-you-go plan (has usage ID)
-    // If user has a usage ID, they should be charged regardless of subscription status
     if (!userData.stripeUsageId) {
       console.log(
         `ℹ️ User ${userId} has no usage ID - skipping usage reporting`
@@ -282,7 +369,7 @@ async function reportStripeUsage(
     }
 
     console.log(
-      `💳 Processing usage-based billing for pay-as-you-go user ${userId}`
+      `💳 Processing usage-based billing for pay-as-you-go user ${userId} (after free sessions)`
     );
 
     // Report usage to Stripe using the meter events API
@@ -371,35 +458,26 @@ async function createHelpSession(
     // Get user data to check subscription status for priority setting
     let priority = "medium"; // Default priority
     try {
-      const userResult = await dbPool.query(
-        'SELECT "stripeSubscriptionId", "stripeUsageId", "stripeCustomerId" FROM "User" WHERE id = $1',
-        [userId]
-      );
-      const userRows = userResult.rows;
+      const subscriptionInfo = await getUserSubscriptionInfo(userId);
 
-      if (Array.isArray(userRows) && userRows.length > 0) {
-        const userData = userRows[0];
-
-        // Set priority based on subscription status
-        // If user has a subscription, they get high priority
-        if (userData.stripeSubscriptionId) {
-          priority = "high";
-          console.log(
-            `💳 User ${userId} has active subscription - setting priority to HIGH`
-          );
-        } else if (userData.stripeUsageId) {
-          // Pay-as-you-go users (no subscription) get medium priority
-          priority = "medium";
-          console.log(
-            `💳 User ${userId} is on pay-as-you-go plan - setting priority to MEDIUM`
-          );
-        } else {
-          // Free users get low priority
-          priority = "low";
-          console.log(
-            `💳 User ${userId} is a free user - setting priority to LOW`
-          );
-        }
+      // Set priority based on subscription status
+      if (subscriptionInfo.subscriptionType === "subscription") {
+        priority = "high";
+        console.log(
+          `💳 User ${userId} has active subscription - setting priority to HIGH`
+        );
+      } else if (subscriptionInfo.subscriptionType === "pay-as-you-go") {
+        // Pay-as-you-go users get medium priority
+        priority = "medium";
+        console.log(
+          `💳 User ${userId} is on pay-as-you-go plan - setting priority to MEDIUM`
+        );
+      } else {
+        // Free users get low priority
+        priority = "low";
+        console.log(
+          `💳 User ${userId} is a free user - setting priority to LOW`
+        );
       }
     } catch (userError) {
       console.error("Error fetching user subscription data:", userError);
@@ -669,12 +747,11 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
           console.log("⚠️ DEBUG - Option 1: After findUserByPhone call");
 
           if (user) {
-            // User found - get their session count
-            const sessionCount = await countUserSessions(user.id);
-            const remainingSessions = 3 - sessionCount;
+            // User found - get their subscription info
+            const subscriptionInfo = await getUserSubscriptionInfo(user.id);
 
             console.log(
-              `⚠️ DEBUG - User ${user.name} has ${sessionCount} sessions used, ${remainingSessions} remaining`
+              `⚠️ DEBUG - User ${user.name} has ${subscriptionInfo.subscriptionType} plan with ${subscriptionInfo.freeSessionsRemaining} free sessions remaining`
             );
 
             // Prepare additional user info for the greeting
@@ -686,10 +763,14 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
               `⚠️ DEBUG - User profile: Tech usage: ${techUsage}, Experience: ${experienceLevel}, Accessibility: ${accessibilityNeeds}`
             );
 
-            if (sessionCount >= 3) {
-              // No remaining sessions - tell user and hang up
+            // Check if user can make more sessions
+            if (
+              subscriptionInfo.subscriptionType === "free" &&
+              subscriptionInfo.freeSessionsRemaining <= 0
+            ) {
+              // Free user has used all sessions
               console.log(
-                "⚠️ DEBUG - User has reached session limit in Option 1"
+                "⚠️ DEBUG - Free user has reached session limit in Option 1"
               );
 
               // Prepare the full response
@@ -709,7 +790,7 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
 
               resp.hangup();
             } else {
-              // Has remaining sessions - provide options to press 2
+              // User can make more sessions - provide options to press 2
               console.log(
                 "⚠️ DEBUG - User has sessions remaining, presenting option to press 2"
               );
@@ -721,13 +802,37 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
                 method: "POST",
               });
 
-              // Prepare the gather message
+              // Prepare the gather message based on subscription type
               let gatherText = `<speak>Hello ${user.name}! <break time='200ms'/> `;
               gatherText += `Your account email is ${user.email}. <break time='200ms'/> `;
               gatherText += `Your tech usage is ${techUsage} with ${experienceLevel} experience level. <break time='300ms'/> `;
-              gatherText += `You have ${remainingSessions} help ${
-                remainingSessions === 1 ? "session" : "sessions"
-              } remaining this month. <break time='300ms'/> `;
+
+              if (subscriptionInfo.subscriptionType === "subscription") {
+                gatherText += `You have unlimited help sessions with your subscription. <break time='300ms'/> `;
+              } else if (
+                subscriptionInfo.subscriptionType === "pay-as-you-go"
+              ) {
+                if (subscriptionInfo.freeSessionsRemaining > 0) {
+                  gatherText += `You have ${
+                    subscriptionInfo.freeSessionsRemaining
+                  } free help ${
+                    subscriptionInfo.freeSessionsRemaining === 1
+                      ? "session"
+                      : "sessions"
+                  } remaining this month. <break time='300ms'/> `;
+                } else {
+                  gatherText += `You have unlimited help sessions with pay-as-you-go billing. <break time='300ms'/> `;
+                }
+              } else {
+                gatherText += `You have ${
+                  subscriptionInfo.freeSessionsRemaining
+                } help ${
+                  subscriptionInfo.freeSessionsRemaining === 1
+                    ? "session"
+                    : "sessions"
+                } remaining this month. <break time='300ms'/> `;
+              }
+
               gatherText += `To schedule a new session, please press 2 now to talk to a representative.</speak>`;
 
               gather.say(
@@ -825,17 +930,22 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
           let reachedSessionLimit = false;
 
           if (user) {
-            // Registered user found - check their session count
-            const sessionCount = await countUserSessions(user.id);
-            const remainingSessions = 3 - sessionCount;
+            // Registered user found - check their subscription info
+            const subscriptionInfo = await getUserSubscriptionInfo(user.id);
 
             console.log(
-              `✅ Found registered user: ${user.name} (${sessionCount}/3 sessions used)`
+              `✅ Found registered user: ${user.name} (${subscriptionInfo.subscriptionType} plan)`
             );
 
-            if (sessionCount >= 3) {
-              // User has used all their monthly sessions
-              console.log(`⛔ USER ${user.name} HAS REACHED SESSION LIMIT`);
+            // Check if user can make more sessions
+            if (
+              subscriptionInfo.subscriptionType === "free" &&
+              subscriptionInfo.freeSessionsRemaining <= 0
+            ) {
+              // Free user has used all sessions
+              console.log(
+                `⛔ FREE USER ${user.name} HAS REACHED SESSION LIMIT`
+              );
               reachedSessionLimit = true;
 
               // Prepare response for users who hit their session limit
@@ -903,19 +1013,7 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
             if (!isActiveSession) {
               try {
                 // Check if user is on pay-as-you-go plan to prevent multiple sessions
-                const userResult = await dbPool.query(
-                  'SELECT "stripeUsageId", "stripeSubscriptionId" FROM "User" WHERE id = $1',
-                  [user.id]
-                );
-                const userRows = userResult.rows;
-
-                const userData = userRows[0];
-                const isPayAsYouGo =
-                  userData &&
-                  userData.stripeUsageId &&
-                  !userData.stripeSubscriptionId;
-
-                if (isPayAsYouGo) {
+                if (subscriptionInfo.subscriptionType === "pay-as-you-go") {
                   // For pay-as-you-go users, check if they have any recent sessions (within last 24 hours)
                   const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
                   const recentResult = await dbPool.query(
@@ -1596,17 +1694,20 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
       const user = await findUserByPhone(senderNumber);
 
       if (user) {
-        // User found - check their session count
-        const sessionCount = await countUserSessions(user.id);
-        const remainingSessions = Math.max(0, 3 - sessionCount);
+        // User found - check their subscription info
+        const subscriptionInfo = await getUserSubscriptionInfo(user.id);
 
         console.log(
-          `✅ SMS FROM REGISTERED USER: ${user.name} (${sessionCount}/3 sessions used)`
+          `✅ SMS FROM REGISTERED USER: ${user.name} (${subscriptionInfo.subscriptionType} plan)`
         );
 
-        if (sessionCount >= 3) {
-          // User has used all their monthly sessions
-          console.log(`⛔ USER ${user.name} HAS REACHED SESSION LIMIT`);
+        // Check if user can make more sessions
+        if (
+          subscriptionInfo.subscriptionType === "free" &&
+          subscriptionInfo.freeSessionsRemaining <= 0
+        ) {
+          // Free user has used all sessions
+          console.log(`⛔ FREE USER ${user.name} HAS REACHED SESSION LIMIT`);
 
           // Send SMS response to user
           await client.messages.create({
@@ -1624,7 +1725,7 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
         } else {
           // User has sessions remaining - check for existing active SMS session before creating a new one
           console.log(
-            `✅ PROCESSING SMS: From ${user.name} (${remainingSessions} sessions remaining)`
+            `✅ PROCESSING SMS: From ${user.name} (${subscriptionInfo.subscriptionType} plan)`
           );
 
           // Variables to track session state
@@ -1676,19 +1777,7 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
               );
             } else {
               // Check if user is on pay-as-you-go plan to prevent multiple sessions
-              const userResult = await dbPool.query(
-                'SELECT "stripeUsageId", "stripeSubscriptionId" FROM "User" WHERE id = $1',
-                [user.id]
-              );
-              const userRows = userResult.rows;
-
-              const userData = userRows[0];
-              const isPayAsYouGo =
-                userData &&
-                userData.stripeUsageId &&
-                !userData.stripeSubscriptionId;
-
-              if (isPayAsYouGo) {
+              if (subscriptionInfo.subscriptionType === "pay-as-you-go") {
                 // For pay-as-you-go users, check if they have any recent sessions (within last 24 hours)
                 const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
                 const recentResult = await dbPool.query(
@@ -1769,8 +1858,18 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
           let adminMessagePrefix = "";
 
           if (isNewSession) {
-            // New session notification with session count info
-            adminMessagePrefix = `From: ${user.name} (${senderNumber})\nRemaining sessions: ${remainingSessions}/3\n\n`;
+            // New session notification with subscription info
+            if (subscriptionInfo.subscriptionType === "subscription") {
+              adminMessagePrefix = `From: ${user.name} (${senderNumber})\nPlan: Subscription (Unlimited)\n\n`;
+            } else if (subscriptionInfo.subscriptionType === "pay-as-you-go") {
+              if (subscriptionInfo.freeSessionsRemaining > 0) {
+                adminMessagePrefix = `From: ${user.name} (${senderNumber})\nPlan: Pay-as-you-go (${subscriptionInfo.freeSessionsRemaining} free sessions remaining)\n\n`;
+              } else {
+                adminMessagePrefix = `From: ${user.name} (${senderNumber})\nPlan: Pay-as-you-go (Billing active)\n\n`;
+              }
+            } else {
+              adminMessagePrefix = `From: ${user.name} (${senderNumber})\nPlan: Free (${subscriptionInfo.freeSessionsRemaining} sessions remaining)\n\n`;
+            }
           } else {
             // Ongoing conversation notification
             adminMessagePrefix = `${user.name} (${senderNumber}) replied to their ongoing conversation.\n\n`;
@@ -1793,17 +1892,18 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
 
           // Only send the confirmation message if this is a new session
           if (isNewSession) {
-            // Format the message based on which session number this is
+            // Format the message based on subscription type
             let sessionMessage = "";
-            if (sessionCount === 0) {
-              // First session
-              sessionMessage = `This is your first session of 3 this month.`;
-            } else if (sessionCount === 1) {
-              // Second session
-              sessionMessage = `This is your second session of 3 this month.`;
-            } else if (sessionCount === 2) {
-              // Third session
-              sessionMessage = `This is your final session of 3 this month.`;
+            if (subscriptionInfo.subscriptionType === "subscription") {
+              sessionMessage = `You have unlimited sessions with your subscription.`;
+            } else if (subscriptionInfo.subscriptionType === "pay-as-you-go") {
+              if (subscriptionInfo.freeSessionsRemaining > 0) {
+                sessionMessage = `This is one of your ${subscriptionInfo.freeSessionsRemaining} remaining free sessions this month.`;
+              } else {
+                sessionMessage = `This session will be billed to your pay-as-you-go account.`;
+              }
+            } else {
+              sessionMessage = `This is one of your ${subscriptionInfo.freeSessionsRemaining} remaining free sessions this month.`;
             }
 
             await client.messages.create({

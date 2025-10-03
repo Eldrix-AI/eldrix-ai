@@ -1877,9 +1877,7 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
 
           // Common part of the message including chat link
           const chatLink = helpSessionId
-            ? `${
-                process.env.FRONTEND_URL || "http://localhost:3001"
-              }/chat?id=${helpSessionId}`
+            ? `https://admin.eldrix.app/chat?id=${helpSessionId}`
             : "";
 
           await client.messages.create({
@@ -1946,7 +1944,7 @@ app.post("/twilio/sms", (req: Request, res: Response) => {
 
           // Forward the message to admin/representative with free trial info
           await client.messages.create({
-            body: `FREE TRIAL SMS from: ${senderNumber}\n\nTo reply directly to this user, respond with your message OR start with their number: ${senderNumber} Your message here\n\nClick here to respond in web interface: http://localhost:3001/chat?id=${freeTrialSessionId}\n\n${combinedMessage}`,
+            body: `FREE TRIAL SMS from: ${senderNumber}\n\nTo reply directly to this user, respond with your message OR start with their number: ${senderNumber} Your message here\n\nClick here to respond in web interface: https://admin.eldrix.app/chat?id=${freeTrialSessionId}\n\n${combinedMessage}`,
             from: TWILIO_PHONE_NUMBER,
             to: ADMIN_PHONE,
           });

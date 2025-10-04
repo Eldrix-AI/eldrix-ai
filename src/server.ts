@@ -720,11 +720,12 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
   });
 
   const digits = req.body.Digits;
-  // Force HTTPS for ngrok URLs or Vercel deployments
-  const host =
-    req.get("host")?.includes("ngrok") || process.env.VERCEL_URL
-      ? `https://${req.get("host") || process.env.VERCEL_URL}`
-      : `${req.protocol}://${req.get("host")}`;
+  // Force HTTPS for all deployments (especially Vercel)
+  const host = process.env.VERCEL_URL
+    ? `https://${process.env.VERCEL_URL}`
+    : req.get("host")?.includes("ngrok")
+    ? `https://${req.get("host")}`
+    : `${req.protocol}://${req.get("host")}`;
   const resp = new VoiceResponse();
 
   // Check if this is a response to the gather with digits
@@ -910,8 +911,10 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
       // Make this async to handle database operations
       (async () => {
         try {
-          // Force dynamic URL for Twilio API callbacks
-          const host = req.get("host")?.includes("ngrok")
+          // Force HTTPS for all deployments (especially Vercel)
+          const host = process.env.VERCEL_URL
+            ? `https://${process.env.VERCEL_URL}`
+            : req.get("host")?.includes("ngrok")
             ? `https://${req.get("host")}`
             : `${req.protocol}://${req.get("host")}`;
 
@@ -1509,11 +1512,12 @@ app.post("/twilio/no-answer", (req: Request, res: Response) => {
 app.post("/twilio/free-trial", (req: Request, res: Response) => {
   const digits = req.body.Digits;
   const callerNumber = req.body.From || "";
-  // Force HTTPS for ngrok URLs or Vercel deployments
-  const host =
-    req.get("host")?.includes("ngrok") || process.env.VERCEL_URL
-      ? `https://${req.get("host") || process.env.VERCEL_URL}`
-      : `${req.protocol}://${req.get("host")}`;
+  // Force HTTPS for all deployments (especially Vercel)
+  const host = process.env.VERCEL_URL
+    ? `https://${process.env.VERCEL_URL}`
+    : req.get("host")?.includes("ngrok")
+    ? `https://${req.get("host")}`
+    : `${req.protocol}://${req.get("host")}`;
 
   console.log("🎁 FREE TRIAL RESPONSE", {
     callSid: req.body.CallSid,

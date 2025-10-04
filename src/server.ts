@@ -1447,6 +1447,17 @@ app.post("/twilio/no-answer", (req: Request, res: Response) => {
         },
         "<speak>Thank you for your call to Eldrix. <break time='300ms'/> Your support session will remain active for 30 minutes in case you need to call back. <break time='200ms'/> Have a great day!</speak>"
       );
+    } else if (dialStatus === "busy") {
+      // Representative is busy (on another call)
+      console.log("📵 CALL BUSY: Representative is on another call");
+
+      resp.say(
+        {
+          voice: "Polly.Joanna",
+          language: "en-US",
+        },
+        "<speak>Sorry, our representative is currently on another call. <break time='300ms'/> We'll call you back as soon as they're available. <break time='200ms'/> For faster responses, please try texting us instead. <break time='200ms'/> Thank you for contacting Eldrix!</speak>"
+      );
     } else {
       // Call was not answered or failed
       console.log("❌ CALL NOT ANSWERED: Status " + dialStatus);
@@ -1459,8 +1470,12 @@ app.post("/twilio/no-answer", (req: Request, res: Response) => {
         "<speak>Sorry, we couldn't reach our representative at this time. <break time='300ms'/> We'll call you back as soon as possible. <break time='200ms'/> For faster responses, please try texting us instead. <break time='200ms'/> Thank you for contacting Eldrix!</speak>"
       );
 
-      // Send follow-up SMS after failed call
-      if (originalCallerNumber && TWILIO_PHONE_NUMBER) {
+      // Send follow-up SMS after failed call (only for non-busy calls)
+      if (
+        originalCallerNumber &&
+        TWILIO_PHONE_NUMBER &&
+        dialStatus !== "busy"
+      ) {
         try {
           client.messages
             .create({
@@ -1487,16 +1502,57 @@ app.post("/twilio/no-answer", (req: Request, res: Response) => {
         }
       }
 
+      // Send follow-up SMS for busy calls
+      if (
+        originalCallerNumber &&
+        TWILIO_PHONE_NUMBER &&
+        dialStatus === "busy"
+      ) {
+        try {
+          client.messages
+            .create({
+              body: "Sorry, our representative is currently on another call. We'll call you back as soon as they're available. For immediate support, reply to this message.",
+              from: TWILIO_PHONE_NUMBER,
+              to: originalCallerNumber,
+            })
+            .then((message) => {
+              console.log(
+                `✅ Follow-up SMS sent after busy call: ${message.sid}`
+              );
+            })
+            .catch((err) => {
+              console.error(
+                "Error sending follow-up SMS after busy call:",
+                err
+              );
+            });
+        } catch (error) {
+          console.error(
+            "Error initiating follow-up SMS after busy call:",
+            error
+          );
+        }
+      }
+
       // Notify admin about missed call
       try {
+        const alertMessage =
+          dialStatus === "busy"
+            ? `📞 BUSY CALL ALERT: ${originalCallerNumber} (${callerDescription}) called but representative was busy (on another call). A follow-up SMS has been sent to them.`
+            : `📞 MISSED CALL ALERT: ${originalCallerNumber} (${callerDescription}) called but the call was not answered (${dialStatus}). A follow-up SMS has been sent to them.`;
+
         client.messages
           .create({
-            body: `📞 MISSED CALL ALERT: ${originalCallerNumber} (${callerDescription}) called but the call was not answered (${dialStatus}). A follow-up SMS has been sent to them.`,
+            body: alertMessage,
             from: TWILIO_PHONE_NUMBER,
             to: ADMIN_PHONE,
           })
           .then((message) => {
-            console.log(`✅ Admin notified about missed call: ${message.sid}`);
+            console.log(
+              `✅ Admin notified about ${
+                dialStatus === "busy" ? "busy" : "missed"
+              } call: ${message.sid}`
+            );
           })
           .catch((err) => {
             console.error(

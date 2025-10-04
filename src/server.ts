@@ -708,8 +708,6 @@ app.get("/api/test-dial", (req: Request, res: Response) => {
   res.type("text/xml").send(resp.toString());
 });
 
-// Note: Concurrent call detection removed due to serverless function limitations
-
 // 1) Inbound call: IVR menu
 app.post("/twilio/voice", (req: Request, res: Response) => {
   console.log("📞 INCOMING CALL", {
@@ -720,6 +718,74 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
     status: req.body.CallStatus,
     timestamp: new Date().toISOString(),
   });
+
+  // Check for active calls in database (async)
+  (async () => {
+    try {
+      // Check if there are any recent active calls (within last 5 minutes)
+      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+      const activeCallResult = await dbPool.query(
+        'SELECT * FROM "ActiveCall" WHERE "createdAt" > $1 AND "endedAt" IS NULL',
+        [fiveMinutesAgo]
+      );
+
+      if (activeCallResult.rows.length > 0) {
+        console.log(
+          "📵 CONCURRENT CALL DETECTED: Representative is on another call"
+        );
+
+        const resp = new VoiceResponse();
+        resp.say(
+          {
+            voice: "Polly.Joanna",
+            language: "en-US",
+          },
+          "<speak>Hello, this is Eldrix. <break time='200ms'/> Our representative is currently helping another customer. <break time='300ms'/> We'll call you back as soon as they're available. <break time='200ms'/> For immediate support, please send us a text message. <break time='200ms'/> Thank you for calling Eldrix!</speak>"
+        );
+        resp.hangup();
+
+        // Send SMS notification to caller
+        const callerNumber = req.body.From;
+        if (callerNumber && TWILIO_PHONE_NUMBER) {
+          client.messages
+            .create({
+              body: "Sorry, our representative is currently on another call. We'll call you back as soon as they're available. For immediate support, reply to this message.",
+              from: TWILIO_PHONE_NUMBER,
+              to: callerNumber,
+            })
+            .catch((err) =>
+              console.error("Error sending concurrent call SMS:", err)
+            );
+        }
+
+        // Notify admin
+        client.messages
+          .create({
+            body: `📞 CONCURRENT CALL: ${callerNumber} called while representative was on another call. SMS sent to caller.`,
+            from: TWILIO_PHONE_NUMBER,
+            to: ADMIN_PHONE,
+          })
+          .catch((err) =>
+            console.error(
+              "Error sending admin concurrent call notification:",
+              err
+            )
+          );
+
+        res.type("text/xml").send(resp.toString());
+        return;
+      }
+
+      // Record this call as active
+      await dbPool.query(
+        'INSERT INTO "ActiveCall" (id, "callSid", "callerNumber", "createdAt") VALUES ($1, $2, $3, $4)',
+        [req.body.CallSid, req.body.CallSid, req.body.From, new Date()]
+      );
+    } catch (error) {
+      console.error("Error checking for concurrent calls:", error);
+      // Continue with normal flow if database check fails
+    }
+  })();
 
   const digits = req.body.Digits;
   // Force HTTPS for all deployments (especially Vercel)
@@ -1120,6 +1186,8 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
             )}&userId=${encodeURIComponent(user?.id || "")}`,
             recordingStatusCallbackMethod: "POST",
             // Machine detection is handled in the no-answer endpoint
+            // Use hangupOnStar to allow hanging up with *
+            hangupOnStar: true,
           });
 
           console.log(`📞 DIAL CONFIGURATION:`, {
@@ -2383,14 +2451,71 @@ app.post("/twilio/call-status", (req: Request, res: Response) => {
         duration || "unknown"
       } seconds`
     );
+    // Mark call as ended in database
+    (async () => {
+      try {
+        await dbPool.query(
+          'UPDATE "ActiveCall" SET "endedAt" = $1 WHERE "callSid" = $2',
+          [new Date(), callSid]
+        );
+      } catch (error) {
+        console.error("Error updating active call end time:", error);
+      }
+    })();
   } else if (callStatus === "busy") {
     console.log(`📵 CALL BUSY: ${callSid} - ${to} is busy`);
+    // Mark call as ended in database
+    (async () => {
+      try {
+        await dbPool.query(
+          'UPDATE "ActiveCall" SET "endedAt" = $1 WHERE "callSid" = $2',
+          [new Date(), callSid]
+        );
+      } catch (error) {
+        console.error("Error updating active call end time:", error);
+      }
+    })();
   } else if (callStatus === "no-answer") {
     console.log(`📵 CALL NO ANSWER: ${callSid} - ${to} did not answer`);
+    // Mark call as ended in database
+    (async () => {
+      try {
+        await dbPool.query(
+          'UPDATE "ActiveCall" SET "endedAt" = $1 WHERE "callSid" = $2',
+          [new Date(), callSid]
+        );
+      } catch (error) {
+        console.error("Error updating active call end time:", error);
+      }
+    })();
   } else if (callStatus === "failed") {
     console.log(`❌ CALL FAILED: ${callSid} - Call failed to ${to}`);
+    // Mark call as ended in database
+    (async () => {
+      try {
+        await dbPool.query(
+          'UPDATE "ActiveCall" SET "endedAt" = $1 WHERE "callSid" = $2',
+          [new Date(), callSid]
+        );
+      } catch (error) {
+        console.error("Error updating active call end time:", error);
+      }
+    })();
   } else {
     console.log(`📞 CALL STATUS: ${callSid} - Status: ${callStatus}`);
+    // Mark call as ended for terminal statuses
+    if (["canceled", "cancelled"].includes(callStatus)) {
+      (async () => {
+        try {
+          await dbPool.query(
+            'UPDATE "ActiveCall" SET "endedAt" = $1 WHERE "callSid" = $2',
+            [new Date(), callSid]
+          );
+        } catch (error) {
+          console.error("Error updating active call end time:", error);
+        }
+      })();
+    }
   }
 
   // This endpoint just logs the status and responds with 200 OK

@@ -2354,8 +2354,8 @@ async function downloadFileFromUrl(
       method: "GET",
       url: url,
       responseType: "stream",
-      timeout: 30000, // 30 second timeout
-      maxContentLength: 50 * 1024 * 1024, // 50MB max file size
+      timeout: 10000, // 10 second timeout - fail fast
+      maxContentLength: 10 * 1024 * 1024, // 10MB max file size
       auth:
         authUsername && authPassword
           ? {

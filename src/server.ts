@@ -2371,7 +2371,17 @@ async function downloadFileFromUrl(
 
     const streamPipeline = promisify(pipeline);
     const writer = createWriteStream(tempFilePath);
-    await streamPipeline(response.data, writer);
+
+    // Add a timeout wrapper around the pipeline
+    const pipelinePromise = streamPipeline(response.data, writer);
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("Download timeout after 8 seconds")),
+        8000
+      );
+    });
+
+    await Promise.race([pipelinePromise, timeoutPromise]);
 
     console.log(`✅ Download complete: ${tempFilePath}`);
     return tempFilePath;

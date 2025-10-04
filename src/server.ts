@@ -1313,199 +1313,226 @@ app.get("/twilio/no-answer", (req: Request, res: Response) => {
 });
 
 app.post("/twilio/no-answer", (req: Request, res: Response) => {
-  const callSid = req.body.CallSid;
-  const dialStatus = req.body.DialCallStatus;
-  const dialCallSid = req.body.DialCallSid;
-  const dialCallDuration = req.body.DialCallDuration;
-  const machineDetection = req.body.AnsweringMachineDetection;
-  const originalCallerNumber = req.body.From || "";
-  const toNumber = req.body.To || "";
+  try {
+    const callSid = req.body.CallSid;
+    const dialStatus = req.body.DialCallStatus;
+    const dialCallSid = req.body.DialCallSid;
+    const dialCallDuration = req.body.DialCallDuration;
+    const machineDetection = req.body.AnsweringMachineDetection;
+    const originalCallerNumber = req.body.From || "";
+    const toNumber = req.body.To || "";
 
-  console.log("📵 CALL COMPLETION HANDLER TRIGGERED", {
-    callSid: callSid,
-    dialStatus: dialStatus,
-    dialCallSid: dialCallSid,
-    dialCallDuration: dialCallDuration,
-    machineDetection: machineDetection,
-    originalCaller: originalCallerNumber,
-    toNumber: toNumber,
-    timestamp: new Date().toISOString(),
-  });
+    console.log("📵 CALL COMPLETION HANDLER TRIGGERED", {
+      callSid: callSid,
+      dialStatus: dialStatus,
+      dialCallSid: dialCallSid,
+      dialCallDuration: dialCallDuration,
+      machineDetection: machineDetection,
+      originalCaller: originalCallerNumber,
+      toNumber: toNumber,
+      timestamp: new Date().toISOString(),
+    });
 
-  const dialDuration = parseInt(dialCallDuration || "0", 10);
-  const resp = new VoiceResponse();
+    const dialDuration = parseInt(dialCallDuration || "0", 10);
+    const resp = new VoiceResponse();
 
-  console.log(`📞 CALL FORWARDING RESULT:`, {
-    dialStatus: dialStatus,
-    duration: dialDuration,
-    machineDetection: machineDetection || "not detected",
-    originalCaller: originalCallerNumber,
-    forwardedTo: toNumber,
-  });
+    console.log(`📞 CALL FORWARDING RESULT:`, {
+      dialStatus: dialStatus,
+      duration: dialDuration,
+      machineDetection: machineDetection || "not detected",
+      originalCaller: originalCallerNumber,
+      forwardedTo: toNumber,
+    });
 
-  // Get caller info from original call
-  const callerParams = req.query.callerInfo
-    ? JSON.parse(decodeURIComponent(req.query.callerInfo as string))
-    : {};
-  const callerType = callerParams.type || "unknown";
-  const callerName = callerParams.name || "";
-  const isRegistered = callerType === "customer";
-  const isFreeTrial = callerType === "freetrial";
-  const isReturning = callerType === "returning";
+    // Get caller info from original call
+    const callerParams = req.query.callerInfo
+      ? JSON.parse(decodeURIComponent(req.query.callerInfo as string))
+      : {};
+    const callerType = callerParams.type || "unknown";
+    const callerName = callerParams.name || "";
+    const isRegistered = callerType === "customer";
+    const isFreeTrial = callerType === "freetrial";
+    const isReturning = callerType === "returning";
 
-  // Prepare caller description for admin notification
-  let callerDescription = "";
-  if (isRegistered) {
-    callerDescription = `registered customer ${callerName}`;
-  } else if (isFreeTrial) {
-    callerDescription = "free trial customer";
-  } else if (isReturning) {
-    callerDescription = "returning customer who already used their free trial";
-  } else {
-    callerDescription = "unknown caller type";
-  }
-
-  // Check for answering machine/voicemail
-  if (machineDetection === "machine") {
-    // Handle voicemail scenario
-    console.log("🤖 VOICEMAIL DETECTED: Leaving a message");
-
-    resp.say(
-      {
-        voice: "Polly.Joanna",
-        language: "en-US",
-      },
-      "<speak>Hello, this is Eldrix calling. We received your call but couldn't reach you. Please call us back during business hours or send us a text message for faster support. Thank you!</speak>"
-    );
-    resp.hangup();
-
-    // Send follow-up SMS after voicemail
-    if (originalCallerNumber && TWILIO_PHONE_NUMBER) {
-      try {
-        client.messages
-          .create({
-            body: "We just tried to reach you but got your voicemail. For faster support, reply to this message and we'll assist you right away.",
-            from: TWILIO_PHONE_NUMBER,
-            to: originalCallerNumber,
-          })
-          .then((message) => {
-            console.log(
-              `✅ Follow-up SMS sent after voicemail: ${message.sid}`
-            );
-          })
-          .catch((err) => {
-            console.error("Error sending follow-up SMS after voicemail:", err);
-          });
-      } catch (error) {
-        console.error("Error initiating follow-up SMS after voicemail:", error);
-      }
+    // Prepare caller description for admin notification
+    let callerDescription = "";
+    if (isRegistered) {
+      callerDescription = `registered customer ${callerName}`;
+    } else if (isFreeTrial) {
+      callerDescription = "free trial customer";
+    } else if (isReturning) {
+      callerDescription =
+        "returning customer who already used their free trial";
+    } else {
+      callerDescription = "unknown caller type";
     }
 
-    // Notify admin about voicemail
-    try {
-      client.messages
-        .create({
-          body: `📞 MISSED CALL ALERT: ${originalCallerNumber} (${callerDescription}) called but went to voicemail. A follow-up SMS has been sent to them.`,
-          from: TWILIO_PHONE_NUMBER,
-          to: ADMIN_PHONE,
-        })
-        .then((message) => {
-          console.log(`✅ Admin notified about voicemail: ${message.sid}`);
-        })
-        .catch((err) => {
-          console.error(
-            "Error sending admin notification about voicemail:",
-            err
-          );
-        });
-    } catch (error) {
-      console.error(
-        "Error initiating admin notification about voicemail:",
-        error
+    // Check for answering machine/voicemail
+    if (machineDetection === "machine") {
+      // Handle voicemail scenario
+      console.log("🤖 VOICEMAIL DETECTED: Leaving a message");
+
+      resp.say(
+        {
+          voice: "Polly.Joanna",
+          language: "en-US",
+        },
+        "<speak>Hello, this is Eldrix calling. We received your call but couldn't reach you. Please call us back during business hours or send us a text message for faster support. Thank you!</speak>"
       );
-    }
-  }
-  // Check if the call was actually answered and completed (normal hang up)
-  else if (dialStatus === "completed" && dialDuration > 0) {
-    // Call was answered and completed normally - thank them
-    console.log(
-      "✅ CALL COMPLETED NORMALLY: Duration " + dialDuration + " seconds"
-    );
+      resp.hangup();
 
-    resp.say(
-      {
-        voice: "Polly.Joanna",
-        language: "en-US",
-      },
-      "<speak>Thank you for your call to Eldrix. <break time='300ms'/> Your support session will remain active for 30 minutes in case you need to call back. <break time='200ms'/> Have a great day!</speak>"
-    );
-  } else {
-    // Call was not answered or failed
-    console.log("❌ CALL NOT ANSWERED: Status " + dialStatus);
+      // Send follow-up SMS after voicemail
+      if (originalCallerNumber && TWILIO_PHONE_NUMBER) {
+        try {
+          client.messages
+            .create({
+              body: "We just tried to reach you but got your voicemail. For faster support, reply to this message and we'll assist you right away.",
+              from: TWILIO_PHONE_NUMBER,
+              to: originalCallerNumber,
+            })
+            .then((message) => {
+              console.log(
+                `✅ Follow-up SMS sent after voicemail: ${message.sid}`
+              );
+            })
+            .catch((err) => {
+              console.error(
+                "Error sending follow-up SMS after voicemail:",
+                err
+              );
+            });
+        } catch (error) {
+          console.error(
+            "Error initiating follow-up SMS after voicemail:",
+            error
+          );
+        }
+      }
 
-    resp.say(
-      {
-        voice: "Polly.Joanna",
-        language: "en-US",
-      },
-      "<speak>Sorry, we couldn't reach our representative at this time. <break time='300ms'/> We'll call you back as soon as possible. <break time='200ms'/> For faster responses, please try texting us instead. <break time='200ms'/> Thank you for contacting Eldrix!</speak>"
-    );
-
-    // Send follow-up SMS after failed call
-    if (originalCallerNumber && TWILIO_PHONE_NUMBER) {
+      // Notify admin about voicemail
       try {
         client.messages
           .create({
-            body: "Sorry we missed your call! For immediate support, reply to this message and our team will assist you right away.",
+            body: `📞 MISSED CALL ALERT: ${originalCallerNumber} (${callerDescription}) called but went to voicemail. A follow-up SMS has been sent to them.`,
             from: TWILIO_PHONE_NUMBER,
-            to: originalCallerNumber,
+            to: ADMIN_PHONE,
           })
           .then((message) => {
-            console.log(
-              `✅ Follow-up SMS sent after missed call: ${message.sid}`
-            );
+            console.log(`✅ Admin notified about voicemail: ${message.sid}`);
           })
           .catch((err) => {
             console.error(
-              "Error sending follow-up SMS after missed call:",
+              "Error sending admin notification about voicemail:",
               err
             );
           });
       } catch (error) {
         console.error(
-          "Error initiating follow-up SMS after missed call:",
+          "Error initiating admin notification about voicemail:",
+          error
+        );
+      }
+    }
+    // Check if the call was actually answered and completed (normal hang up)
+    else if (dialStatus === "completed" && dialDuration > 0) {
+      // Call was answered and completed normally - thank them
+      console.log(
+        "✅ CALL COMPLETED NORMALLY: Duration " + dialDuration + " seconds"
+      );
+
+      resp.say(
+        {
+          voice: "Polly.Joanna",
+          language: "en-US",
+        },
+        "<speak>Thank you for your call to Eldrix. <break time='300ms'/> Your support session will remain active for 30 minutes in case you need to call back. <break time='200ms'/> Have a great day!</speak>"
+      );
+    } else {
+      // Call was not answered or failed
+      console.log("❌ CALL NOT ANSWERED: Status " + dialStatus);
+
+      resp.say(
+        {
+          voice: "Polly.Joanna",
+          language: "en-US",
+        },
+        "<speak>Sorry, we couldn't reach our representative at this time. <break time='300ms'/> We'll call you back as soon as possible. <break time='200ms'/> For faster responses, please try texting us instead. <break time='200ms'/> Thank you for contacting Eldrix!</speak>"
+      );
+
+      // Send follow-up SMS after failed call
+      if (originalCallerNumber && TWILIO_PHONE_NUMBER) {
+        try {
+          client.messages
+            .create({
+              body: "Sorry we missed your call! For immediate support, reply to this message and our team will assist you right away.",
+              from: TWILIO_PHONE_NUMBER,
+              to: originalCallerNumber,
+            })
+            .then((message) => {
+              console.log(
+                `✅ Follow-up SMS sent after missed call: ${message.sid}`
+              );
+            })
+            .catch((err) => {
+              console.error(
+                "Error sending follow-up SMS after missed call:",
+                err
+              );
+            });
+        } catch (error) {
+          console.error(
+            "Error initiating follow-up SMS after missed call:",
+            error
+          );
+        }
+      }
+
+      // Notify admin about missed call
+      try {
+        client.messages
+          .create({
+            body: `📞 MISSED CALL ALERT: ${originalCallerNumber} (${callerDescription}) called but the call was not answered (${dialStatus}). A follow-up SMS has been sent to them.`,
+            from: TWILIO_PHONE_NUMBER,
+            to: ADMIN_PHONE,
+          })
+          .then((message) => {
+            console.log(`✅ Admin notified about missed call: ${message.sid}`);
+          })
+          .catch((err) => {
+            console.error(
+              "Error sending admin notification about missed call:",
+              err
+            );
+          });
+      } catch (error) {
+        console.error(
+          "Error initiating admin notification about missed call:",
           error
         );
       }
     }
 
-    // Notify admin about missed call
-    try {
-      client.messages
-        .create({
-          body: `📞 MISSED CALL ALERT: ${originalCallerNumber} (${callerDescription}) called but the call was not answered (${dialStatus}). A follow-up SMS has been sent to them.`,
-          from: TWILIO_PHONE_NUMBER,
-          to: ADMIN_PHONE,
-        })
-        .then((message) => {
-          console.log(`✅ Admin notified about missed call: ${message.sid}`);
-        })
-        .catch((err) => {
-          console.error(
-            "Error sending admin notification about missed call:",
-            err
-          );
-        });
-    } catch (error) {
-      console.error(
-        "Error initiating admin notification about missed call:",
-        error
-      );
-    }
-  }
+    resp.hangup();
+    res.type("text/xml").send(resp.toString());
+  } catch (error) {
+    console.error("❌ ERROR in no-answer handler:", {
+      error: error instanceof Error ? error.message : error,
+      stack: error instanceof Error ? error.stack : undefined,
+      timestamp: new Date().toISOString(),
+    });
 
-  resp.hangup();
-  res.type("text/xml").send(resp.toString());
+    // Send a simple error response
+    const errorResp = new VoiceResponse();
+    errorResp.say(
+      {
+        voice: "Polly.Joanna",
+        language: "en-US",
+      },
+      "<speak>We're sorry, there was a technical error. Please try again later.</speak>"
+    );
+    errorResp.hangup();
+    res.type("text/xml").send(errorResp.toString());
+  }
 });
 
 // 4) Free trial confirmation handler
@@ -1654,95 +1681,120 @@ app.post("/twilio/free-trial", (req: Request, res: Response) => {
 
 // 5) Whisper handler - plays a message to the recipient before connecting the call
 app.post("/twilio/whisper", (req: Request, res: Response) => {
-  const type = req.query.type as string;
-  const name = req.query.name as string;
-  const activeSession = req.query.activeSession === "true";
-  const sessionId = (req.query.sessionId as string) || "";
-  const callerNumber = req.body.From || "(unknown)";
-  const formattedPhone = callerNumber.replace(/^\+1/, ""); // Remove +1 for display
+  try {
+    const type = req.query.type as string;
+    const name = req.query.name as string;
+    const activeSession = req.query.activeSession === "true";
+    const sessionId = (req.query.sessionId as string) || "";
+    const callerNumber = req.body.From || "(unknown)";
+    const formattedPhone = callerNumber.replace(/^\+1/, ""); // Remove +1 for display
 
-  console.log("💬 WHISPER", {
-    type,
-    name,
-    callerNumber,
-    activeSession,
-    sessionId,
-  });
-  console.log(`📞 WHISPER PREPARING CALL: Connecting to ${FORWARD_NUMBER}`);
+    console.log("💬 WHISPER ENDPOINT CALLED", {
+      type,
+      name,
+      callerNumber,
+      activeSession,
+      sessionId,
+      queryParams: req.query,
+      bodyParams: req.body,
+      timestamp: new Date().toISOString(),
+    });
+    console.log(`📞 WHISPER PREPARING CALL: Connecting to ${FORWARD_NUMBER}`);
 
-  const resp = new VoiceResponse();
+    const resp = new VoiceResponse();
 
-  if (type === "customer") {
-    // Registered customer
-    // Add different message based on active session status
-    let sessionInfo = "";
-    if (activeSession) {
-      sessionInfo = `This is a continuation of an existing session.`;
-    } else {
-      sessionInfo = `This is a new support session.`;
-    }
+    if (type === "customer") {
+      // Registered customer
+      // Add different message based on active session status
+      let sessionInfo = "";
+      if (activeSession) {
+        sessionInfo = `This is a continuation of an existing session.`;
+      } else {
+        sessionInfo = `This is a new support session.`;
+      }
 
-    resp.say(
-      {
-        voice: "Polly.Joanna",
-        language: "en-US",
-      },
-      `<speak>
+      resp.say(
+        {
+          voice: "Polly.Joanna",
+          language: "en-US",
+        },
+        `<speak>
         Incoming call from registered customer ${name || "with account"}.
         <break time="500ms"/>
         ${sessionInfo}
         <break time="500ms"/>
         Connecting now.
       </speak>`
-    );
-  } else if (type === "freetrial") {
-    // Free trial
-    resp.say(
-      {
-        voice: "Polly.Joanna",
-        language: "en-US",
-      },
-      `<speak>
+      );
+    } else if (type === "freetrial") {
+      // Free trial
+      resp.say(
+        {
+          voice: "Polly.Joanna",
+          language: "en-US",
+        },
+        `<speak>
         Incoming call from new free trial customer.
         <break time="500ms"/>
         This is their first call.
         <break time="500ms"/>
         Connecting now.
       </speak>`
-    );
-  } else if (type === "returning") {
-    // Returning non-registered customer
-    resp.say(
-      {
-        voice: "Polly.Joanna",
-        language: "en-US",
-      },
-      `<speak>
+      );
+    } else if (type === "returning") {
+      // Returning non-registered customer
+      resp.say(
+        {
+          voice: "Polly.Joanna",
+          language: "en-US",
+        },
+        `<speak>
         Incoming call from returning customer without active subscription.
         <break time="500ms"/>
         They've already used their free trial.
         <break time="500ms"/>
         Connecting now.
       </speak>`
-    );
-  } else {
-    // Default/unknown
-    resp.say(
-      {
-        voice: "Polly.Joanna",
-        language: "en-US",
-      },
-      `<speak>
+      );
+    } else {
+      // Default/unknown
+      resp.say(
+        {
+          voice: "Polly.Joanna",
+          language: "en-US",
+        },
+        `<speak>
         Incoming customer call.
         <break time="500ms"/>
         Status: unknown.
         <break time="500ms"/>
         Connecting now.
       </speak>`
-    );
-  }
+      );
+    }
 
-  res.type("text/xml").send(resp.toString());
+    console.log("💬 WHISPER RESPONSE GENERATED:", resp.toString());
+    res.type("text/xml").send(resp.toString());
+  } catch (error) {
+    console.error("❌ ERROR in whisper endpoint:", {
+      error: error instanceof Error ? error.message : error,
+      stack: error instanceof Error ? error.stack : undefined,
+      queryParams: req.query,
+      bodyParams: req.body,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Send a simple error response
+    const errorResp = new VoiceResponse();
+    errorResp.say(
+      {
+        voice: "Polly.Joanna",
+        language: "en-US",
+      },
+      "<speak>Incoming call. Connecting now.</speak>"
+    );
+    res.type("text/xml").send(errorResp.toString());
+  }
 });
 
 // 6) SMS handling endpoint for incoming text messages

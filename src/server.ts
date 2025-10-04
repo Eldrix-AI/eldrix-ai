@@ -2354,6 +2354,8 @@ async function downloadFileFromUrl(
       method: "GET",
       url: url,
       responseType: "stream",
+      timeout: 30000, // 30 second timeout
+      maxContentLength: 50 * 1024 * 1024, // 50MB max file size
       auth:
         authUsername && authPassword
           ? {
@@ -2361,6 +2363,10 @@ async function downloadFileFromUrl(
               password: authPassword,
             }
           : undefined,
+      headers: {
+        "User-Agent": "Eldrix-Recording-Downloader/1.0",
+        Accept: "audio/wav, audio/*, */*",
+      },
     });
 
     const streamPipeline = promisify(pipeline);
@@ -2371,7 +2377,8 @@ async function downloadFileFromUrl(
     return tempFilePath;
   } catch (error) {
     console.error("Error downloading file:", error);
-    throw error;
+    // Don't throw the error, just return empty string so we can continue with original URL
+    return "";
   }
 }
 
@@ -2401,8 +2408,10 @@ async function uploadFileToBlob(
   } finally {
     // Clean up temp file
     try {
-      fs.unlinkSync(filePath);
-      console.log(`🧹 Cleaned up temp file: ${filePath}`);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        console.log(`🧹 Cleaned up temp file: ${filePath}`);
+      }
     } catch (cleanupError) {
       console.error("Error cleaning up temp file:", cleanupError);
     }
@@ -2451,13 +2460,21 @@ app.post("/twilio/recording-status", (req: Request, res: Response) => {
             TWILIO_AUTH_TOKEN
           );
 
-          // Upload to Vercel Blob
-          const filename = `call-recordings/${recordingSid}_${new Date()
-            .toISOString()
-            .replace(/[:.]/g, "-")}.wav`;
-          blobUrl = await uploadFileToBlob(localFilePath, filename);
+          // Only try to upload if download was successful
+          if (localFilePath) {
+            // Upload to Vercel Blob
+            const filename = `call-recordings/${recordingSid}_${new Date()
+              .toISOString()
+              .replace(/[:.]/g, "-")}.wav`;
+            blobUrl = await uploadFileToBlob(localFilePath, filename);
 
-          console.log(`🎉 Recording saved to Vercel Blob: ${blobUrl}`);
+            console.log(`🎉 Recording saved to Vercel Blob: ${blobUrl}`);
+          } else {
+            console.log(
+              `⚠️ Recording download failed, using original Twilio URL`
+            );
+            blobUrl = "";
+          }
         } catch (storageError) {
           console.error("Error saving recording to Vercel Blob:", storageError);
           // Continue with the original Twilio URL if Blob upload fails

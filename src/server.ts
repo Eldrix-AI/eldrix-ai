@@ -2637,7 +2637,7 @@ app.post("/twilio/sms/respond", (req: Request, res: Response) => {
 });
 
 // Export the app for Vercel serverless
-module.exports = app;
+export default app;
 
 // Start the server only when running locally
 if (process.env.NODE_ENV !== "production") {

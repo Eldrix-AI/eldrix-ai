@@ -1090,6 +1090,18 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
           // Build the response with whisper and recording enabled
           // Note: For machine detection, we'll need to use call creation API instead,
           // as TwiML doesn't support all machine detection features
+
+          console.log(`📞 CALL FORWARDING SETUP:`, {
+            callerNumber: callerNumber,
+            forwardNumber: FORWARD_NUMBER,
+            whisperType: whisperType,
+            whisperName: whisperName,
+            isActiveSession: isActiveSession,
+            sessionId: existingSessionId,
+            host: host,
+            whisperUrl: whisperUrl,
+          });
+
           const dial = resp.dial({
             timeout: 20, // Shorter timeout to avoid long waits
             callerId: TWILIO_PHONE_NUMBER,
@@ -1103,6 +1115,18 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
             )}&userId=${encodeURIComponent(user?.id || "")}`,
             recordingStatusCallbackMethod: "POST",
             // Machine detection is handled in the no-answer endpoint
+          });
+
+          console.log(`📞 DIAL CONFIGURATION:`, {
+            timeout: 20,
+            callerId: TWILIO_PHONE_NUMBER,
+            action: `${host}/twilio/no-answer?callerInfo=${encodeURIComponent(
+              callerInfo
+            )}`,
+            record: "record-from-answer",
+            recordingStatusCallback: `${host}/twilio/recording-status?originalCaller=${encodeURIComponent(
+              callerNumber
+            )}&userId=${encodeURIComponent(user?.id || "")}`,
           });
 
           // Use the number with whisper URL
@@ -1121,41 +1145,96 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
             FORWARD_NUMBER
           );
 
+          console.log(`📞 FORWARDING TO ${FORWARD_NUMBER}:`, {
+            statusCallbackEvents: [
+              "initiated",
+              "ringing",
+              "answered",
+              "completed",
+            ],
+            statusCallback: `${host}/twilio/call-status`,
+            whisperUrl: whisperUrl,
+            targetNumber: FORWARD_NUMBER,
+          });
+
           console.log(
             `🔧 FORWARDING WITH WHISPER: TwiML generated:`,
             resp.toString()
           );
           res.type("text/xml").send(resp.toString());
         } catch (error) {
-          console.error("Error during user lookup for call forwarding:", error);
+          console.error("❌ ERROR during user lookup for call forwarding:", {
+            error: error instanceof Error ? error.message : error,
+            stack: error instanceof Error ? error.stack : undefined,
+            callerNumber: req.body.From || "unknown",
+            forwardNumber: FORWARD_NUMBER,
+            host: host,
+            timestamp: new Date().toISOString(),
+          });
 
           // In case of error, fall back to simple forwarding
           console.log(
-            `⚠️ Error during user lookup - falling back to simple forwarding`
+            `⚠️ FALLBACK FORWARDING: Error during user lookup - using simple forwarding to ${FORWARD_NUMBER}`
           );
 
-          const dial = resp.dial({
-            timeout: 30,
-            callerId: TWILIO_PHONE_NUMBER,
-            action: `${host}/twilio/no-answer`,
-            method: "POST",
-          });
+          try {
+            const dial = resp.dial({
+              timeout: 30,
+              callerId: TWILIO_PHONE_NUMBER,
+              action: `${host}/twilio/no-answer`,
+              method: "POST",
+            });
 
-          dial.number(
-            {
-              statusCallbackEvent: [
-                "initiated",
-                "ringing",
-                "answered",
-                "completed",
-              ],
-              statusCallback: `${host}/twilio/call-status`,
-              statusCallbackMethod: "POST",
-            },
-            FORWARD_NUMBER
-          );
+            console.log(`📞 FALLBACK DIAL CONFIG:`, {
+              timeout: 30,
+              callerId: TWILIO_PHONE_NUMBER,
+              action: `${host}/twilio/no-answer`,
+              targetNumber: FORWARD_NUMBER,
+            });
 
-          res.type("text/xml").send(resp.toString());
+            dial.number(
+              {
+                statusCallbackEvent: [
+                  "initiated",
+                  "ringing",
+                  "answered",
+                  "completed",
+                ],
+                statusCallback: `${host}/twilio/call-status`,
+                statusCallbackMethod: "POST",
+              },
+              FORWARD_NUMBER
+            );
+
+            console.log(
+              `📞 FALLBACK FORWARDING: TwiML generated:`,
+              resp.toString()
+            );
+            res.type("text/xml").send(resp.toString());
+          } catch (fallbackError) {
+            console.error("❌ CRITICAL ERROR in fallback forwarding:", {
+              error:
+                fallbackError instanceof Error
+                  ? fallbackError.message
+                  : fallbackError,
+              stack:
+                fallbackError instanceof Error
+                  ? fallbackError.stack
+                  : undefined,
+              timestamp: new Date().toISOString(),
+            });
+
+            // Last resort - send error response
+            resp.say(
+              {
+                voice: "Polly.Joanna",
+                language: "en-US",
+              },
+              "<speak>We're sorry, there was a technical error. Please try again later.</speak>"
+            );
+            resp.hangup();
+            res.type("text/xml").send(resp.toString());
+          }
         }
       })();
 
@@ -1231,24 +1310,37 @@ app.get("/twilio/no-answer", (req: Request, res: Response) => {
 });
 
 app.post("/twilio/no-answer", (req: Request, res: Response) => {
+  const callSid = req.body.CallSid;
+  const dialStatus = req.body.DialCallStatus;
+  const dialCallSid = req.body.DialCallSid;
+  const dialCallDuration = req.body.DialCallDuration;
+  const machineDetection = req.body.AnsweringMachineDetection;
+  const originalCallerNumber = req.body.From || "";
+  const toNumber = req.body.To || "";
+
   console.log("📵 CALL COMPLETION HANDLER TRIGGERED", {
-    callSid: req.body.CallSid,
-    dialStatus: req.body.DialCallStatus,
-    dialCallSid: req.body.DialCallSid,
-    dialCallStatus: req.body.DialCallStatus,
-    dialCallDuration: req.body.DialCallDuration,
+    callSid: callSid,
+    dialStatus: dialStatus,
+    dialCallSid: dialCallSid,
+    dialCallDuration: dialCallDuration,
+    machineDetection: machineDetection,
+    originalCaller: originalCallerNumber,
+    toNumber: toNumber,
     timestamp: new Date().toISOString(),
   });
 
-  const dialStatus = req.body.DialCallStatus;
-  const dialDuration = parseInt(req.body.DialCallDuration || "0", 10);
-  const machineDetection = req.body.AnsweringMachineDetection;
+  const dialDuration = parseInt(dialCallDuration || "0", 10);
   const resp = new VoiceResponse();
 
-  console.log(`📞 MACHINE DETECTION: ${machineDetection || "not detected"}`);
+  console.log(`📞 CALL FORWARDING RESULT:`, {
+    dialStatus: dialStatus,
+    duration: dialDuration,
+    machineDetection: machineDetection || "not detected",
+    originalCaller: originalCallerNumber,
+    forwardedTo: toNumber,
+  });
 
   // Get caller info from original call
-  const originalCallerNumber = req.body.From || "";
   const callerParams = req.query.callerInfo
     ? JSON.parse(decodeURIComponent(req.query.callerInfo as string))
     : {};
@@ -2139,14 +2231,51 @@ app.post("/twilio/sms-reply", (req: Request, res: Response) => {
 
 // 8) Call status tracking endpoint
 app.post("/twilio/call-status", (req: Request, res: Response) => {
+  const callSid = req.body.CallSid;
+  const callStatus = req.body.CallStatus;
+  const from = req.body.From;
+  const to = req.body.To;
+  const direction = req.body.Direction;
+  const duration = req.body.CallDuration;
+  const answeredBy = req.body.AnsweredBy;
+
   console.log("📞 CALL STATUS UPDATE", {
-    callSid: req.body.CallSid,
-    callStatus: req.body.CallStatus,
-    from: req.body.From,
-    to: req.body.To,
-    direction: req.body.Direction,
+    callSid: callSid,
+    callStatus: callStatus,
+    from: from,
+    to: to,
+    direction: direction,
+    duration: duration,
+    answeredBy: answeredBy,
     timestamp: new Date().toISOString(),
   });
+
+  // Log specific status changes with more detail
+  if (callStatus === "initiated") {
+    console.log(`🚀 CALL INITIATED: ${callSid} - From: ${from} to ${to}`);
+  } else if (callStatus === "ringing") {
+    console.log(`📞 CALL RINGING: ${callSid} - Ringing ${to}`);
+  } else if (callStatus === "answered") {
+    console.log(
+      `✅ CALL ANSWERED: ${callSid} - ${to} answered the call${
+        answeredBy ? ` (answered by: ${answeredBy})` : ""
+      }`
+    );
+  } else if (callStatus === "completed") {
+    console.log(
+      `🏁 CALL COMPLETED: ${callSid} - Duration: ${
+        duration || "unknown"
+      } seconds`
+    );
+  } else if (callStatus === "busy") {
+    console.log(`📵 CALL BUSY: ${callSid} - ${to} is busy`);
+  } else if (callStatus === "no-answer") {
+    console.log(`📵 CALL NO ANSWER: ${callSid} - ${to} did not answer`);
+  } else if (callStatus === "failed") {
+    console.log(`❌ CALL FAILED: ${callSid} - Call failed to ${to}`);
+  } else {
+    console.log(`📞 CALL STATUS: ${callSid} - Status: ${callStatus}`);
+  }
 
   // This endpoint just logs the status and responds with 200 OK
   res.status(200).send("OK");
@@ -2507,7 +2636,12 @@ app.post("/twilio/sms/respond", (req: Request, res: Response) => {
   })();
 });
 
-// Start the server
-app.listen(Number(PORT), () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+// Export the app for Vercel serverless
+export default app;
+
+// Start the server only when running locally
+if (process.env.NODE_ENV !== "production") {
+  app.listen(Number(PORT), () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+  });
+}

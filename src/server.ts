@@ -708,8 +708,7 @@ app.get("/api/test-dial", (req: Request, res: Response) => {
   res.type("text/xml").send(resp.toString());
 });
 
-// Track active calls to detect concurrent calls
-const activeCalls = new Set<string>();
+// Note: Concurrent call detection removed due to serverless function limitations
 
 // 1) Inbound call: IVR menu
 app.post("/twilio/voice", (req: Request, res: Response) => {
@@ -721,54 +720,6 @@ app.post("/twilio/voice", (req: Request, res: Response) => {
     status: req.body.CallStatus,
     timestamp: new Date().toISOString(),
   });
-
-  // Check if this is a concurrent call (we already have an active call)
-  if (activeCalls.size > 0) {
-    console.log(
-      "📵 CONCURRENT CALL DETECTED: Representative is on another call"
-    );
-
-    const resp = new VoiceResponse();
-    resp.say(
-      {
-        voice: "Polly.Joanna",
-        language: "en-US",
-      },
-      "<speak>Hello, this is Eldrix. <break time='200ms'/> Our representative is currently helping another customer. <break time='300ms'/> We'll call you back as soon as they're available. <break time='200ms'/> For immediate support, please send us a text message. <break time='200ms'/> Thank you for calling Eldrix!</speak>"
-    );
-    resp.hangup();
-
-    // Send SMS notification to caller
-    const callerNumber = req.body.From;
-    if (callerNumber && TWILIO_PHONE_NUMBER) {
-      client.messages
-        .create({
-          body: "Sorry, our representative is currently on another call. We'll call you back as soon as they're available. For immediate support, reply to this message.",
-          from: TWILIO_PHONE_NUMBER,
-          to: callerNumber,
-        })
-        .catch((err) =>
-          console.error("Error sending concurrent call SMS:", err)
-        );
-    }
-
-    // Notify admin
-    client.messages
-      .create({
-        body: `📞 CONCURRENT CALL: ${callerNumber} called while representative was on another call. SMS sent to caller.`,
-        from: TWILIO_PHONE_NUMBER,
-        to: ADMIN_PHONE,
-      })
-      .catch((err) =>
-        console.error("Error sending admin concurrent call notification:", err)
-      );
-
-    res.type("text/xml").send(resp.toString());
-    return;
-  }
-
-  // Add this call to active calls
-  activeCalls.add(req.body.CallSid);
 
   const digits = req.body.Digits;
   // Force HTTPS for all deployments (especially Vercel)
@@ -2432,26 +2383,14 @@ app.post("/twilio/call-status", (req: Request, res: Response) => {
         duration || "unknown"
       } seconds`
     );
-    // Remove from active calls
-    activeCalls.delete(callSid);
   } else if (callStatus === "busy") {
     console.log(`📵 CALL BUSY: ${callSid} - ${to} is busy`);
-    // Remove from active calls
-    activeCalls.delete(callSid);
   } else if (callStatus === "no-answer") {
     console.log(`📵 CALL NO ANSWER: ${callSid} - ${to} did not answer`);
-    // Remove from active calls
-    activeCalls.delete(callSid);
   } else if (callStatus === "failed") {
     console.log(`❌ CALL FAILED: ${callSid} - Call failed to ${to}`);
-    // Remove from active calls
-    activeCalls.delete(callSid);
   } else {
     console.log(`📞 CALL STATUS: ${callSid} - Status: ${callStatus}`);
-    // Remove from active calls for any other terminal status
-    if (["canceled", "cancelled"].includes(callStatus)) {
-      activeCalls.delete(callSid);
-    }
   }
 
   // This endpoint just logs the status and responds with 200 OK
